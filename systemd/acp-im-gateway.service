@@ -1,0 +1,47 @@
+[Unit]
+Description=acp-im-gateway — drive an ACP coding agent from Telegram
+Documentation=https://github.com/XofoSol/acp-im-gateway#readme
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# No secrets in this file. Point EnvironmentFile at a file you own (chmod 600)
+# that exports TELEGRAM_BOT_TOKEN, ALLOWED_USER_IDS, PROJECTS_ROOT, ALLOWED_ROOTS, ...
+# Example:
+#   mkdir -p ~/.config/acp-im-gateway
+#   printf 'TELEGRAM_BOT_TOKEN=...\nALLOWED_USER_IDS=...\nPROJECTS_ROOT=/home/you/Projects\n' \
+#     > ~/.config/acp-im-gateway/gateway.env
+#   chmod 600 ~/.config/acp-im-gateway/gateway.env
+EnvironmentFile=%h/.config/acp-im-gateway/gateway.env
+
+# Console script installed by `pipx install .` or `pip install --user .`.
+# With a virtualenv instead use an absolute interpreter path:
+#   ExecStart=/path/to/.venv/bin/python -m acp_im_gateway run
+ExecStart=%h/.local/bin/acp-im-gateway run
+
+Restart=on-failure
+RestartSec=5
+
+# Hardening that keeps the agent working. Do not add ProtectHome= or
+# PrivateTmp= without checking that your agent still reaches its own state
+# directory (~/.reasonix) and its credentials.
+NoNewPrivileges=true
+ProtectSystem=full
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=acp-im-gateway
+
+# Recommended: install this as a *user* unit, so the gateway runs as you:
+#   cp systemd/acp-im-gateway.service ~/.config/systemd/user/
+#   systemctl --user enable --now acp-im-gateway
+#   journalctl --user -u acp-im-gateway -f          # pairing codes appear here
+#
+# For a system-wide install, uncomment and set these to your own account.
+# Running as root would hand the agent root over a chat.
+#User=your-local-username
+#WorkingDirectory=/home/your-local-username
+
+[Install]
+WantedBy=default.target
