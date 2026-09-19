@@ -56,7 +56,11 @@ Verified surface of `reasonix acp` (v1.17.21, main-v2 docs) — build against th
 - `session/cancel {sessionId}` to stop a turn.
 - `session/list {cwd?}` -> live/persisted sessions; `session/close {sessionId}`.
 - Inbound agent requests: `session/request_permission` must be answered by the client with the
-  option id the agent advertised. This is how approvals reach the chat.
+  option id the agent advertised, wrapped in ACP's **nested** outcome —
+  `{"outcome": {"outcome": "selected", "optionId": "..."}}`, or
+  `{"outcome": {"outcome": "cancelled"}}` to decline/expire. The agent decodes the reply into
+  `PermissionRequestResult{Outcome PermissionOutcome}`, so a flat outcome fails its
+  unmarshaller and the tool call reads as declined. This is how approvals reach the chat.
 - Vendor: `_reasonix.io/session/steer` for mid-turn guidance (send only if the agent advertises it).
 
 Requirements:

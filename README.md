@@ -287,9 +287,14 @@ Tap a button to answer the agent.
 ```
 
 * Buttons come from the options the agent advertised, allow-options first. If the
-  agent advertises no reject option, a `Deny` button answers `{"outcome":"cancelled"}`.
+  agent advertises no reject option, a `Deny` button answers
+  `{"outcome":{"outcome":"cancelled"}}`.
 * Each tap is answered with the exact `optionId` the agent offered, so the agent's
-  own permission rules stay in charge.
+  own permission rules stay in charge. The reply uses ACP's *nested* outcome —
+  `{"outcome":{"outcome":"selected","optionId":"…"}}` — because the agent decodes
+  it into `PermissionRequestResult{Outcome PermissionOutcome}`, whose `outcome` key
+  holds an object. A flat `{"outcome":"selected",…}` fails that unmarshaller, the
+  reply is rejected and the tool call silently reads as declined.
 * Callbacks from users who are not allowlisted are refused (`Not authorised.`), and
   a callback from another chat than the one that was asked is refused too.
 * Nothing is left hanging: an unanswered approval expires (`GATEWAY_APPROVAL_TIMEOUT`)

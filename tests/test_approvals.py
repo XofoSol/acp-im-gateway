@@ -270,7 +270,7 @@ def test_callback_answers_the_agent_and_clears_the_buttons() -> None:
         {
             "jsonrpc": "2.0",
             "id": 7,
-            "result": {"outcome": "selected", "optionId": "allow_always"},
+            "result": {"outcome": {"outcome": "selected", "optionId": "allow_always"}},
         }
     ]
     assert bridge.pending == {}
@@ -288,7 +288,9 @@ def test_deny_button_with_an_advertised_reject_option() -> None:
     bridge.handle_callback(
         {"data": "ap:tok12345:2", "message": {"chat": {"id": CHAT_ID}}}, authorized=True
     )
-    assert agent.writes[0]["result"] == {"outcome": "selected", "optionId": "reject_once"}
+    assert agent.writes[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "reject_once"}
+    }
 
 
 def test_deny_button_without_a_reject_option_cancels() -> None:
@@ -300,7 +302,7 @@ def test_deny_button_without_a_reject_option_cancels() -> None:
     bridge.handle_callback(
         {"data": "ap:tok12345:x", "message": {"chat": {"id": CHAT_ID}}}, authorized=True
     )
-    assert agent.writes[0]["result"] == {"outcome": "cancelled"}
+    assert agent.writes[0]["result"] == {"outcome": {"outcome": "cancelled"}}
 
 
 def test_callback_from_an_unauthorised_user_is_refused() -> None:
@@ -362,7 +364,7 @@ def test_bad_option_index_keeps_the_prompt_alive() -> None:
     bridge.handle_callback(
         {"data": "ap:tok12345:0", "message": {"chat": {"id": CHAT_ID}}}, authorized=True
     )
-    assert agent.writes[0]["result"]["optionId"] == "allow_once"
+    assert agent.writes[0]["result"]["outcome"]["optionId"] == "allow_once"
 
 
 def test_expiry_answers_cancelled_and_updates_the_message() -> None:
@@ -375,7 +377,7 @@ def test_expiry_answers_cancelled_and_updates_the_message() -> None:
     assert bridge.expire_due() == 0
     clock.advance(61.0)
     assert bridge.expire_due() == 1
-    assert agent.writes[0]["result"] == {"outcome": "cancelled"}
+    assert agent.writes[0]["result"] == {"outcome": {"outcome": "cancelled"}}
     assert "expired" in telegram.edits(CHAT_ID)[-1].text
     assert bridge.open_count(CHAT_ID) == 0
 
@@ -386,10 +388,92 @@ def test_cancel_chat_clears_stale_buttons() -> None:
     agent = RecordingAgent()
     open_request(bridge, agent)
     assert bridge.cancel_chat(CHAT_ID, "the turn ended") == 1
-    assert agent.writes[0]["result"] == {"outcome": "cancelled"}
+    assert agent.writes[0]["result"] == {"outcome": {"outcome": "cancelled"}}
     assert "the turn ended" in telegram.edits(CHAT_ID)[-1].text
     assert bridge.open_count(CHAT_ID) == 0
     assert bridge.cancel_chat(CHAT_ID) == 0
+
+
+# --------------------------------------------------------------------------- wire shape
+#
+# Regression for the bug where every approval tap reached the agent as a DECLINE.
+# The reply must use ACP's NESTED outcome: the agent decodes it into
+# ``PermissionRequestResult{Outcome PermissionOutcome}`` where ``PermissionOutcome``
+# is itself an object (internal/acp/protocol.go, DeepSeek-Reasonix), and dispatch
+# switches on ``res.Outcome.OptionID`` (internal/acp/dispatch.go). A flat
+# ``{"outcome": "selected", "optionId": ...}`` cannot unmarshal into that struct,
+# so the reply is rejected and the tool call reads as declined. These tests pin the
+# exact JSON written back on all four paths.
+ALLOW_RESULT = {"outcome": {"outcome": "selected", "optionId": "allow_always"}}
+CANCEL_RESULT = {"outcome": {"outcome": "cancelled"}}
+
+
+def test_allow_writes_the_nested_outcome_object() -> None:
+    bridge = make_bridge(FakeTelegram(), FakeClock())
+    agent = RecordingAgent()
+    open_request(bridge, agent)
+
+    assert bridge.resolve("tok12345", "1") == "Answered: Always allow"
+
+    assert agent.writes == [{"jsonrpc": "2.0", "id": 7, "result": ALLOW_RESULT}]
+
+
+def test_deny_via_an_advertised_reject_option_writes_the_nested_selected_outcome() -> None:
+    bridge = make_bridge(FakeTelegram(), FakeClock())
+    agent = RecordingAgent()
+    open_request(bridge, agent)
+
+    assert bridge.resolve("tok12345", "2") == "Answered: Reject"
+
+    assert agent.writes[0]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "reject_once"}
+    }
+
+
+def test_deny_fallback_writes_the_nested_cancelled_outcome() -> None:
+    params = dict(PERMISSION_PARAMS)
+    params["options"] = [{"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"}]
+    bridge = make_bridge(FakeTelegram(), FakeClock())
+    agent = RecordingAgent()
+    open_request(bridge, agent, params=params)
+
+    assert bridge.resolve("tok12345", "x") == "Answered: Denied"
+
+    assert agent.writes[0]["result"] == CANCEL_RESULT
+
+
+def test_expiry_writes_the_nested_cancelled_outcome() -> None:
+    clock = FakeClock()
+    bridge = make_bridge(FakeTelegram(), clock, timeout=60.0)
+    agent = RecordingAgent()
+    open_request(bridge, agent)
+
+    clock.advance(61.0)
+    assert bridge.expire_due() == 1
+
+    assert agent.writes[0]["result"] == CANCEL_RESULT
+
+
+def test_cancel_writes_the_nested_cancelled_outcome() -> None:
+    bridge = make_bridge(FakeTelegram(), FakeClock())
+    agent = RecordingAgent()
+    open_request(bridge, agent)
+
+    assert bridge.cancel_chat(CHAT_ID, "the turn ended") == 1
+
+    assert agent.writes[0]["result"] == CANCEL_RESULT
+
+
+def test_no_path_writes_a_flat_outcome_string() -> None:
+    """The flat shape is exactly what broke every approval: guard it as an invariant."""
+    bridge = make_bridge(FakeTelegram(), FakeClock())
+    agent = RecordingAgent()
+    open_request(bridge, agent)
+    bridge.resolve("tok12345", "0")
+
+    outcome = agent.writes[0]["result"]["outcome"]
+    assert isinstance(outcome, dict), f"outcome must be an object, got {outcome!r}"
+    assert set(outcome) <= {"outcome", "optionId"}
 
 
 def test_option_labels_helper() -> None:

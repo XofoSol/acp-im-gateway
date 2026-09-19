@@ -400,9 +400,13 @@ def test_approval_buttons_reach_the_chat_and_the_answer_reaches_the_agent(make_h
     assert harness.wait_idle()
     responses = harness.permission_responses()
     assert responses[0]["message"]["result"] == {
-        "outcome": "selected",
-        "optionId": "allow_always",
+        "outcome": {"outcome": "selected", "optionId": "allow_always"}
     }
+    # End-to-end proof of the fix: the agent decodes the tap as an ALLOW, not a
+    # decline. A flat outcome would be rejected by its unmarshaller and the tool
+    # call would read as denied, which is the bug this guards against.
+    decisions = events_named(harness.agent_events(), "permission_decision")
+    assert decisions and decisions[0]["allowed"] is True
 
 
 def test_callback_from_an_unauthorised_user_is_refused_by_the_gateway(make_harness: Any) -> None:

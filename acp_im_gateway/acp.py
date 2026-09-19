@@ -82,6 +82,30 @@ class AcpTimeout(AcpError):
 
 # --------------------------------------------------------------------------- payloads
 
+# ``session/request_permission`` result builders.
+#
+# The agent decodes this reply into a NESTED struct: Reasonix's adapter declares
+# ``PermissionRequestResult{Outcome PermissionOutcome}`` where ``PermissionOutcome``
+# is itself an object with ``outcome``/``optionId`` keys (``internal/acp/protocol.go``,
+# DeepSeek-Reasonix), and dispatch switches on ``res.Outcome.OptionID``
+# (``internal/acp/dispatch.go``). So the wire shape is
+# ``{"outcome": {"outcome": "selected", "optionId": "..."}}``.
+#
+# A FLAT ``{"outcome": "selected", "optionId": "..."}`` cannot unmarshal into that
+# struct, the reply is rejected, and the agent treats the tool call as declined --
+# the bug that silently turned every approval tap into a denial. Build both shapes
+# through these helpers only; never hand-write the dict.
+
+
+def permission_selected(option_id: str) -> dict[str, Any]:
+    """The nested result for an *allowed* tool call (the agent's own ``optionId``)."""
+    return {"outcome": {"outcome": "selected", "optionId": str(option_id)}}
+
+
+def permission_cancelled() -> dict[str, Any]:
+    """The nested result for a declined, expired or cancelled request."""
+    return {"outcome": {"outcome": "cancelled"}}
+
 
 @dataclass
 class AgentCapabilities:
@@ -661,7 +685,7 @@ class AcpClient:
     def _default_inbound(self, request: InboundRequest) -> Any:
         """No handler configured: refuse permission requests, decline the rest."""
         if request.method == "session/request_permission":
-            return {"outcome": "cancelled"}
+            return permission_cancelled()
         return DECLINE
 
     def _forget_inbound(self, request_id: Any) -> None:

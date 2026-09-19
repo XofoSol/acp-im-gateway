@@ -8,6 +8,10 @@ permission prompts, crashes and respawns.
 
 Every request it receives is appended to ``--log <path>`` as one JSON object per
 line, which is how tests assert what actually crossed the wire.
+
+Permission replies are decoded exactly like the real agent (Reasonix): the result
+is unmarshalled into a *nested* struct, so a flat outcome is rejected and the tool
+call is reported as declined. See :meth:`FakeAgent.decode_permission_result`.
 """
 
 from __future__ import annotations
@@ -18,10 +22,44 @@ import os
 import sys
 from typing import Any, Mapping
 
+#: Option ids the real agent's dispatch switch treats as an approval
+#: (``internal/acp/dispatch.go``: ``switch res.Outcome.OptionID``). Every other id
+#: -- a reject option, or one the agent never advertised -- leaves ``allow`` false,
+#: i.e. the tool call is declined. Mirrored here so a fake-agent run exercises the
+#: same decision the real agent would make.
+ALLOWING_OPTION_IDS = frozenset(
+    {
+        "allow_once",
+        "allow_always",
+        "reasonix_write_once",
+        "reasonix_write_session",
+    }
+)
+
+#: Option ids that also persist the grant for the rest of the session.
+SESSION_OPTION_IDS = frozenset({"allow_always", "reasonix_write_session"})
+
 
 def emit(obj: Mapping[str, Any]) -> None:
     sys.stdout.write(json.dumps(obj) + "\n")
     sys.stdout.flush()
+
+
+def _json_kind(value: Any) -> str:
+    """The name Go's ``json`` decoder uses for a value's kind, for error parity."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, str):
+        return "string"
+    if isinstance(value, Mapping):
+        return "object"
+    if isinstance(value, (list, tuple)):
+        return "array"
+    if isinstance(value, (int, float)):
+        return "number"
+    return "object"
 
 
 class FakeAgent:
@@ -272,7 +310,71 @@ class FakeAgent:
             self.log("unexpected_response", message=message)
             return
         self.log(f"{kind}_response", message=message)
+        if kind == "permission":
+            self.decide_permission(message.get("result"))
         self.finish_prompt_for_waiting("end_turn")
+
+    # ------------------------------------------------------------------ permission
+
+    def decode_permission_result(self, result: Any) -> tuple[bool, str, str | None]:
+        """Decode a ``session/request_permission`` result exactly like the real agent.
+
+        The agent unmarshals the reply into
+        ``PermissionRequestResult{Outcome PermissionOutcome}`` where
+        ``PermissionOutcome`` is *itself* an object with ``outcome``/``optionId``
+        keys (``internal/acp/protocol.go``, DeepSeek-Reasonix). The wire shape is
+        therefore NESTED::
+
+            {"outcome": {"outcome": "selected", "optionId": "allow_once"}}
+
+        and anything else -- notably a FLAT ``{"outcome": "selected", ...}`` --
+        makes Go's ``json.Unmarshal`` fail, after which ``dispatch.go`` leaves
+        ``allow`` false and the tool call is declined. Returns
+        ``(selected, option_id, decode_error)``; ``decode_error`` is set only when
+        the payload is malformed the way the Go unmarshaller would reject it.
+        """
+        if not isinstance(result, Mapping):
+            return False, "", f"cannot unmarshal {_json_kind(result)} into PermissionRequestResult"
+        outer = result.get("outcome")
+        if outer is None:
+            # Go leaves the zero value in place: no error, but no "selected" either.
+            return False, "", None
+        if not isinstance(outer, Mapping):
+            # Exactly Go's failure for a flat outcome: a string where an object is
+            # expected. dispatch.go guards on the error, so the call is declined.
+            return (
+                False,
+                "",
+                "json: cannot unmarshal "
+                f"{_json_kind(outer)} into Go struct field "
+                "PermissionRequestResult.outcome of type acp.PermissionOutcome",
+            )
+        decision = str(outer.get("outcome") or "")
+        option_id = str(outer.get("optionId") or "")
+        return decision == "selected", option_id, None
+
+    def decide_permission(self, result: Any) -> None:
+        """Mirror dispatch.go's decision and record it for the tests to assert."""
+        selected, option_id, decode_error = self.decode_permission_result(result)
+        if decode_error is not None:
+            # dispatch.go never reaches its switch when the unmarshal fails, so the
+            # agent behaves as if the user declined.
+            self.log(
+                "permission_rejected",
+                reason="malformed result",
+                decodeError=decode_error,
+                result=result,
+            )
+            return
+        allowed = selected and option_id in ALLOWING_OPTION_IDS
+        self.log(
+            "permission_decision",
+            selected=selected,
+            optionId=option_id,
+            allowed=allowed,
+            session=allowed and option_id in SESSION_OPTION_IDS,
+            result=result,
+        )
 
     def finish_prompt_for_waiting(self, stop_reason: str) -> None:
         for session_id in list(self.pending_prompts):

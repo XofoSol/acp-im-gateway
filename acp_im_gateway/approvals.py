@@ -17,7 +17,13 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from .acp import DECLINE, DEFER, InboundRequest
+from .acp import (
+    DECLINE,
+    DEFER,
+    InboundRequest,
+    permission_cancelled,
+    permission_selected,
+)
 from .telegram import TelegramClient, TelegramError, inline_keyboard
 
 _logger = logging.getLogger("acp_im_gateway.approvals")
@@ -379,7 +385,7 @@ class ApprovalBridge:
                 return "Already answered."
 
             if index == "x":
-                result: dict[str, Any] = {"outcome": "cancelled"}
+                result: dict[str, Any] = permission_cancelled()
                 label = "Denied"
             else:
                 try:
@@ -389,7 +395,8 @@ class ApprovalBridge:
                     # dropping it here would leave the agent waiting forever.
                     self.log.warning("approval %s: bad option index %r", token, index)
                     return "Unknown option."
-                result = {"outcome": "selected", "optionId": option.option_id}
+                # The agent's own optionId, wrapped in the nested outcome it decodes.
+                result = permission_selected(option.option_id)
                 label = option.name
 
             self.pending.pop(token, None)
@@ -415,7 +422,7 @@ class ApprovalBridge:
                     approval.decision = "expired"
                     due.append(approval)
         for approval in due:
-            approval.inbound.respond({"outcome": "cancelled"})
+            approval.inbound.respond(permission_cancelled())
             self._finish_message(approval, "expired — answered as cancelled")
         if due:
             self.log.info("expired %d unanswered approval(s)", len(due))
@@ -436,7 +443,7 @@ class ApprovalBridge:
                     approval.decision = reason
                     cancelled.append(approval)
         for approval in cancelled:
-            approval.inbound.respond({"outcome": "cancelled"})
+            approval.inbound.respond(permission_cancelled())
             self._finish_message(approval, f"no longer needed — {reason}")
         if cancelled:
             self.log.info("cancelled %d open approval(s) in chat %s", len(cancelled), chat_id)

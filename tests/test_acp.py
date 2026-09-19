@@ -160,12 +160,19 @@ def test_permission_request_is_deferred_then_answered(tmp_path: Path) -> None:
             "reject_once",
         ]
         assert request.answered is False
-        request.respond({"outcome": "selected", "optionId": "allow_always"})
+        request.respond({"outcome": {"outcome": "selected", "optionId": "allow_always"}})
         worker.join(timeout=10.0)
 
     assert outcome and outcome[0].stop_reason == "end_turn"
-    responses = events_named(read_agent_log(log_path), "permission_response")
-    assert responses[0]["message"]["result"] == {"outcome": "selected", "optionId": "allow_always"}
+    events = read_agent_log(log_path)
+    responses = events_named(events, "permission_response")
+    assert responses[0]["message"]["result"] == {
+        "outcome": {"outcome": "selected", "optionId": "allow_always"}
+    }
+    # The fake agent decodes it the way the real agent does: an accepted approval.
+    decisions = events_named(events, "permission_decision")
+    assert decisions[0]["allowed"] is True
+    assert decisions[0]["optionId"] == "allow_always"
 
 
 def test_default_handler_cancels_permission_requests_instead_of_hanging(tmp_path: Path) -> None:
@@ -177,7 +184,51 @@ def test_default_handler_cancels_permission_requests_instead_of_hanging(tmp_path
         result = client.prompt(session.session_id, "run the tests", timeout=10.0)
     assert result.stop_reason == "end_turn"
     responses = events_named(read_agent_log(log_path), "permission_response")
-    assert responses[0]["message"]["result"] == {"outcome": "cancelled"}
+    assert responses[0]["message"]["result"] == {"outcome": {"outcome": "cancelled"}}
+
+
+def test_flat_permission_result_is_rejected_like_the_real_agent(tmp_path: Path) -> None:
+    """Fidelity guard for the bug that reached the agent as a decline every time.
+
+    The real agent unmarshals the reply into
+    ``PermissionRequestResult{Outcome PermissionOutcome}`` where ``PermissionOutcome``
+    is itself an object, so a FLAT ``{"outcome": "selected", "optionId": ...}``
+    fails ``json.Unmarshal`` and ``dispatch.go`` treats the tool call as declined.
+    The fake agent must reject a flat payload the same way -- otherwise a flat
+    reply would sail through the suite unnoticed, which is how this shipped.
+    """
+    log_path = tmp_path / "log.jsonl"
+    pending: list[InboundRequest] = []
+    received = threading.Event()
+
+    def handler(request: InboundRequest) -> Any:
+        if request.method == "session/request_permission":
+            pending.append(request)
+            received.set()
+            return DEFER
+        return DECLINE
+
+    client = make_client(log_path, "--permission", on_request=handler)
+    with client:
+        client.initialize()
+        session = client.new_session(tmp_path)
+        worker = threading.Thread(
+            target=lambda: client.prompt(session.session_id, "run the tests", timeout=10.0),
+            daemon=True,
+        )
+        worker.start()
+        assert received.wait(10.0), "the agent never asked for permission"
+
+        pending[0].respond({"outcome": "selected", "optionId": "allow_once"})
+        worker.join(timeout=10.0)
+
+    events = read_agent_log(log_path)
+    rejected = events_named(events, "permission_rejected")
+    assert rejected, "a flat outcome must be rejected, not silently accepted"
+    assert "PermissionOutcome" in rejected[0]["decodeError"]
+    # The malformed reply never reaches the allow/deny decision, exactly as the
+    # real unmarshaller error short-circuits dispatch.go's switch.
+    assert events_named(events, "permission_decision") == []
 
 
 def test_crash_mid_turn_raises_and_the_agent_comes_back(tmp_path: Path) -> None:
@@ -298,8 +349,8 @@ class _RecordingClient:
 def test_an_inbound_request_is_answered_at_most_once() -> None:
     client = _RecordingClient()
     request = InboundRequest(client, 5, "session/request_permission", {"sessionId": "s1"})
-    assert request.respond({"outcome": "cancelled"}) is True
-    assert request.respond({"outcome": "selected", "optionId": "allow_once"}) is False
+    assert request.respond({"outcome": {"outcome": "cancelled"}}) is True
+    assert request.respond({"outcome": {"outcome": "selected", "optionId": "allow_once"}}) is False
     assert request.fail(-32603, "too late") is False
     assert request.abandon("agent went away") is None
     assert len(client.writes) == 1
@@ -313,7 +364,7 @@ def test_concurrent_answers_to_one_request_write_exactly_one_response() -> None:
 
     def answer(kind: str) -> None:
         result = (
-            request.respond({"outcome": "cancelled"})
+            request.respond({"outcome": {"outcome": "cancelled"}})
             if kind == "respond"
             else request.fail(-32603, "declined")
         )
