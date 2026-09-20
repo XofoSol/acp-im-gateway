@@ -14,6 +14,14 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
+from .render import DEFAULT_OVERFLOW_CHARS, DEFAULT_TOOL_OUTPUT_LINES
+from .tiers import (
+    DEFAULT_ALWAYS_ASK,
+    DEFAULT_AUTO_ALLOW,
+    TierRules,
+    parse_tier_list,
+)
+
 DEFAULT_AGENT_CMD = "reasonix acp"
 DEFAULT_PROJECTS_ROOT = "~/Projects"
 DEFAULT_AGENT_INDEX_DIR = "~/.reasonix/projects"
@@ -25,7 +33,6 @@ DEFAULT_TELEGRAM_API_BASE = "https://api.telegram.org"
 BUSY_MODES = ("steer", "queue")
 #: Tool-approval postures an ACP agent commonly advertises. "" = leave it alone.
 APPROVAL_POSTURES = ("ask", "auto", "yolo", "")
-
 
 class ConfigError(Exception):
     """Raised when the configuration cannot be used as given."""
@@ -170,6 +177,17 @@ class Config:
     log_level: str = "INFO"
     dry_run: bool = False
 
+    # Rendering (Part A of the v1.1 spec: the chat must read like the CLI)
+    tool_output_lines: int = DEFAULT_TOOL_OUTPUT_LINES
+    overflow_chars: int = DEFAULT_OVERFLOW_CHARS
+    show_thinking: bool = True
+    heartbeat_seconds: float = 60.0
+
+    # Approval tiers (Part B): global defaults, overridable per chat.
+    auto_allow: tuple[str, ...] = DEFAULT_AUTO_ALLOW
+    always_ask: tuple[str, ...] = DEFAULT_ALWAYS_ASK
+    tier_overrides: Mapping[int, TierRules] = field(default_factory=dict)
+
     # ------------------------------------------------------------------ helpers
 
     def resolved_roots(self) -> tuple[Path, ...]:
@@ -200,6 +218,16 @@ class Config:
             ("discovery_depth", str(self.discovery_depth)),
             ("log_level", self.log_level),
             ("dry_run", str(self.dry_run)),
+            ("tool_output_lines", str(self.tool_output_lines)),
+            ("overflow_chars", str(self.overflow_chars)),
+            ("show_thinking", str(self.show_thinking)),
+            ("heartbeat_seconds", str(self.heartbeat_seconds)),
+            ("auto_allow", ",".join(self.auto_allow) or "(none)"),
+            ("always_ask", ",".join(self.always_ask) or "(none)"),
+            (
+                "tier_overrides",
+                ",".join(str(chat) for chat in sorted(self.tier_overrides)) or "(none)",
+            ),
         ]
 
     def with_overrides(self, **overrides: Any) -> "Config":
@@ -234,6 +262,19 @@ class Config:
             problems.append(f"GATEWAY_POLL_TIMEOUT must be >= 1, got {self.poll_timeout!r}")
         if self.discovery_depth < 0:
             problems.append(f"GATEWAY_DISCOVERY_DEPTH must be >= 0, got {self.discovery_depth!r}")
+        if self.tool_output_lines < 1:
+            problems.append(
+                f"GATEWAY_TOOL_OUTPUT_LINES must be >= 1, got {self.tool_output_lines!r}"
+            )
+        if self.overflow_chars < 512:
+            problems.append(
+                f"GATEWAY_OVERFLOW_CHARS must be >= 512 (and well under 4096), "
+                f"got {self.overflow_chars!r}"
+            )
+        if self.heartbeat_seconds < 0:
+            problems.append(
+                f"GATEWAY_HEARTBEAT_SECONDS must be >= 0, got {self.heartbeat_seconds!r}"
+            )
         if not self.agent_cmd:
             problems.append("REASONIX_ACP_CMD is empty")
         if problems:
@@ -274,6 +315,7 @@ class Config:
         paths = dict(data.get("paths") or {})
         agent = dict(data.get("agent") or {})
         runtime = dict(data.get("runtime") or {})
+        approvals = dict(data.get("approvals") or {})
 
         def raw(env_name: str, section: Mapping[str, Any], key: str) -> Any:
             """Environment value (if non-empty) else TOML value else None."""
@@ -294,6 +336,13 @@ class Config:
                 return float(value)
             except (TypeError, ValueError) as exc:
                 raise ConfigError(f"{env_name} must be a number, got {value!r}") from exc
+
+        def tier_list(env_name: str, key: str, default: tuple[str, ...]) -> tuple[str, ...]:
+            """Tier lists are lists, not scalars: an *explicitly empty* env value
+            means "turn this tier off", while an absent one means the defaults."""
+            if env_name in environ:
+                return parse_tier_list(environ.get(env_name), default=default)
+            return parse_tier_list(approvals.get(key), default=default)
 
         cfg = cls(
             telegram_bot_token=text("TELEGRAM_BOT_TOKEN", tg, "bot_token", ""),
@@ -329,5 +378,45 @@ class Config:
             discovery_depth=int(number("GATEWAY_DISCOVERY_DEPTH", runtime, "discovery_depth", 1)),
             log_level=text("GATEWAY_LOG_LEVEL", runtime, "log_level", "INFO").upper(),
             dry_run=parse_bool(raw("GATEWAY_DRY_RUN", runtime, "dry_run"), False),
+            tool_output_lines=int(
+                number(
+                    "GATEWAY_TOOL_OUTPUT_LINES",
+                    runtime,
+                    "tool_output_lines",
+                    DEFAULT_TOOL_OUTPUT_LINES,
+                )
+            ),
+            overflow_chars=int(
+                number("GATEWAY_OVERFLOW_CHARS", runtime, "overflow_chars", DEFAULT_OVERFLOW_CHARS)
+            ),
+            show_thinking=parse_bool(
+                raw("GATEWAY_SHOW_THINKING", runtime, "show_thinking"),
+                True,
+            ),
+            heartbeat_seconds=number(
+                "GATEWAY_HEARTBEAT_SECONDS", runtime, "heartbeat_seconds", 60.0
+            ),
+            auto_allow=tier_list("GATEWAY_AUTO_ALLOW", "auto_allow", DEFAULT_AUTO_ALLOW),
+            always_ask=tier_list("GATEWAY_ALWAYS_ASK", "always_ask", DEFAULT_ALWAYS_ASK),
+            tier_overrides=_tier_overrides(approvals.get("chats")),
         )
         return cfg.with_overrides(**(dict(overrides) if overrides else {}))
+
+
+def _tier_overrides(raw: Any) -> dict[int, TierRules]:
+    """Per-chat tier overrides from ``[approvals.chats."<chat id>"]`` blocks."""
+    if not isinstance(raw, Mapping):
+        return {}
+    out: dict[int, TierRules] = {}
+    for chat_id, rules in raw.items():
+        try:
+            key = int(chat_id)
+        except (TypeError, ValueError):
+            raise ConfigError(f"[approvals.chats] key must be a numeric chat id, got {chat_id!r}")
+        if not isinstance(rules, Mapping):
+            raise ConfigError(f"[approvals.chats.{chat_id}] must be a table")
+        out[key] = TierRules(
+            auto_allow=parse_tier_list(rules.get("auto_allow"), default=DEFAULT_AUTO_ALLOW),
+            always_ask=parse_tier_list(rules.get("always_ask"), default=DEFAULT_ALWAYS_ASK),
+        )
+    return out

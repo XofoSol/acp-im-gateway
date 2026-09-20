@@ -51,6 +51,17 @@ class TelegramTransportError(TelegramError):
 
 _FENCE_LINE = re.compile(r"^\s*```(.*)$")
 
+#: Tags :func:`chunk_message` keeps balanced when ``html=True``. Only tags the
+#: gateway itself emits are tracked; agent text is escaped, so it can never
+#: smuggle one in.
+HTML_TAGS = ("pre", "code", "b", "i", "u", "s", "tg-spoiler", "blockquote")
+_HTML_TAG = re.compile(
+    r"</?(?P<tag>" + "|".join(re.escape(tag) for tag in HTML_TAGS) + r")(?:\s[^>]*)?>",
+    re.IGNORECASE,
+)
+#: Room kept for the tags that close at the end of a part.
+_HTML_TAG_RESERVE = 64
+
 
 def scan_fences(text: str, state: str | None = None) -> str | None:
     """Return the language of the code fence left open by ``text`` (None if balanced).
@@ -81,13 +92,21 @@ def _choose_cut(text: str, budget: int) -> int:
     return budget
 
 
-def chunk_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
+def chunk_message(text: str, limit: int = MAX_MESSAGE_LENGTH, *, html: bool = False) -> list[str]:
     """Split ``text`` into ordered parts of at most ``limit`` characters.
 
-    A part that would leave a code fence open gets a closing fence appended, and
-    the next part is prefixed with the same fence, so each part is valid on its
-    own. The original characters are always preserved in order.
+    With ``html=False`` (the default) a part that would leave a ``` code fence
+    open gets a closing fence appended, and the next part is prefixed with the
+    same fence, so each part is valid on its own; the original characters are
+    always preserved in order.
+
+    With ``html=True`` the same guarantee is given for the HTML tags the gateway
+    emits (``<pre>``, ``<code>``, ``<tg-spoiler>``, …): an open tag is closed at
+    the end of a part and reopened at the start of the next one, so Telegram's
+    HTML parser never sees a broken message.
     """
+    if html:
+        return _chunk_html(text, limit)
     if limit < MIN_CHUNK_LIMIT:
         raise ValueError(f"limit must be >= {MIN_CHUNK_LIMIT}, got {limit}")
     if not text:
@@ -114,6 +133,74 @@ def chunk_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
         remaining = remaining[cut:]
         open_lang = scan_fences(body, open_lang)
         parts.append(prefix + body + ("" if open_lang is None else "\n```"))
+    return parts
+
+
+def scan_html(text: str, state: Iterable[str] | None = None) -> tuple[str, ...]:
+    """Return the HTML tags left open by ``text`` (as a stack, innermost last)."""
+    stack = list(state or ())
+    for match in _HTML_TAG.finditer(text):
+        tag = match.group("tag").lower()
+        if match.group(0).startswith("</"):
+            if stack and stack[-1] == tag:
+                stack.pop()
+            elif tag in stack:
+                stack.remove(tag)
+        else:
+            stack.append(tag)
+    return tuple(stack)
+
+
+def _close_tags(stack: Iterable[str]) -> str:
+    return "".join(f"</{tag}>" for tag in reversed(list(stack)))
+
+
+def _open_tags(stack: Iterable[str]) -> str:
+    return "".join(f"<{tag}>" for tag in stack)
+
+
+def _avoid_tag_split(body: str) -> str:
+    """Never cut inside a tag: a part ending in ``</pr`` is not a tag Telegram sees."""
+    start = body.rfind("<")
+    if start != -1 and ">" not in body[start:]:
+        return body[:start]
+    return body
+
+
+def _chunk_html(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    """Split while keeping the gateway's own HTML tags balanced in every part."""
+    if limit < MIN_CHUNK_LIMIT:
+        raise ValueError(f"limit must be >= {MIN_CHUNK_LIMIT}, got {limit}")
+    if not text:
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    parts: list[str] = []
+    remaining = text
+    state: tuple[str, ...] = ()
+    while remaining:
+        prefix = _open_tags(state)
+        room = limit - len(prefix) - _HTML_TAG_RESERVE
+        if room < 1:
+            raise ValueError(f"limit {limit} is too small to split HTML safely")
+        if len(prefix) + len(remaining) + len(_close_tags(state)) <= limit:
+            parts.append(prefix + remaining + _close_tags(state))
+            break
+
+        body = _avoid_tag_split(remaining[:room])
+        body = _avoid_tag_split(body[: _choose_cut(body, len(body))])
+        end_state = scan_html(body, state)
+        while body and len(prefix) + len(body) + len(_close_tags(end_state)) > limit:
+            body = body.rsplit("\n", 1)[0] if "\n" in body else body[:-8]
+            body = _avoid_tag_split(body)
+            end_state = scan_html(body, state)
+        if not body:  # pragma: no cover - a single line longer than `limit`
+            body = _avoid_tag_split(remaining[: max(1, limit - len(prefix) - _HTML_TAG_RESERVE)])
+            end_state = scan_html(body, state)
+        parts.append(prefix + body + _close_tags(end_state))
+        remaining = remaining[len(body) :]
+        state = end_state
     return parts
 
 
@@ -354,11 +441,18 @@ class TelegramClient:
         *,
         reply_markup: Mapping[str, Any] | None = None,
         reply_to_message_id: int | None = None,
+        message_thread_id: int | None = None,
+        parse_mode: str | None = None,
         disable_notification: bool = False,
         chunk: bool = False,
     ) -> list[dict[str, Any]]:
-        """Send plain text (no parse_mode). ``chunk=True`` splits long text into parts."""
-        pieces = chunk_message(plain(text)) if chunk else [plain(text)]
+        """Send text. ``chunk=True`` splits long text into ordered parts.
+
+        ``parse_mode`` defaults to ``None`` (plain text): a broken Markdown or
+        HTML message that fails to send is worse than plain text. The turn
+        transcript opts into ``"HTML"`` with its own escaping.
+        """
+        pieces = chunk_message(plain(text), html=parse_mode == "HTML") if chunk else [plain(text)]
         sent: list[dict[str, Any]] = []
         for index, piece in enumerate(pieces):
             params: dict[str, Any] = {
@@ -366,8 +460,12 @@ class TelegramClient:
                 "text": piece,
                 "disable_web_page_preview": True,
             }
+            if parse_mode is not None:
+                params["parse_mode"] = parse_mode
             if disable_notification:
                 params["disable_notification"] = True
+            if message_thread_id is not None:
+                params["message_thread_id"] = int(message_thread_id)
             if reply_markup is not None and index == 0:
                 params["reply_markup"] = dict(reply_markup)
             if reply_to_message_id is not None and index == 0:
@@ -384,6 +482,7 @@ class TelegramClient:
         text: str,
         *,
         reply_markup: Mapping[str, Any] | None = None,
+        parse_mode: str | None = None,
     ) -> Mapping[str, Any] | None:
         params: dict[str, Any] = {
             "chat_id": chat_id,
@@ -391,6 +490,8 @@ class TelegramClient:
             "text": plain(text),
             "disable_web_page_preview": True,
         }
+        if parse_mode is not None:
+            params["parse_mode"] = parse_mode
         if reply_markup is not None:
             params["reply_markup"] = dict(reply_markup)
         try:
@@ -494,19 +595,29 @@ class MessageStream:
     Bot API work, and never more often than ``edit_interval`` seconds. The caller
     is expected to call :meth:`flush` periodically (the gateway does it on every
     idle poll of the prompt loop) and :meth:`close` when the turn ends.
+
+    :meth:`seal` is what turns a growing transcript into an ordered log: it
+    freezes every message written so far (they are never edited again) and makes
+    the next ``flush`` start a new message, which the gateway does once a message
+    would pass ``overflow_limit`` characters.
     """
 
     client: TelegramClient
     chat_id: int
     edit_interval: float = 1.2
     limit: int = MAX_MESSAGE_LENGTH
+    overflow_limit: int = 3500
     reply_markup: Mapping[str, Any] | None = None
+    parse_mode: str | None = None
+    thread_id: int | None = None
     log: logging.Logger = field(default=_logger)
     clock: Callable[[], float] = time.monotonic
 
     _text: str = ""
     _sent_text: str | None = None
     _messages: list[_SentMessage] = field(default_factory=list)
+    _sealed_text: str = ""
+    _sealed_count: int = 0
     _last_flush: float = 0.0
     _closed: bool = False
 
@@ -519,13 +630,53 @@ class MessageStream:
         return list(self._messages)
 
     @property
+    def sealed_messages(self) -> list[_SentMessage]:
+        """The messages already frozen: they will never be edited again."""
+        return list(self._messages[: self._sealed_count])
+
+    @property
+    def sealed_text(self) -> str:
+        """The text covered by the sealed messages (a prefix of ``text``)."""
+        return self._sealed_text
+
+    @property
     def message_id(self) -> int | None:
         return self._messages[0].message_id if self._messages else None
+
+    @property
+    def live_message_id(self) -> int | None:
+        """The message still being edited, if any."""
+        if len(self._messages) <= self._sealed_count:
+            return None
+        return self._messages[self._sealed_count].message_id
+
+    @property
+    def up_to_date(self) -> bool:
+        """True when every message already shows the newest pushed text."""
+        return self._sent_text == self._text
 
     def push(self, text: str) -> bool:
         """Record new desired text; flush immediately when the interval allows."""
         self._text = text
         return self.flush()
+
+    def seal(self, covered: str | None = None) -> int:
+        """Freeze every message written so far and start a new one.
+
+        Returns the number of sealed messages, or 0 when nothing was frozen — in
+        particular when the newest text is not on screen yet, because freezing
+        there would leave a gap between the frozen message and the next one.
+        ``covered`` is the text the sealed messages hold; it defaults to whatever
+        was last pushed.
+        """
+        if self._closed or not self._messages or not self.up_to_date:
+            return 0
+        self._sealed_count = len(self._messages)
+        self._sealed_text = self._text if covered is None else covered
+        # Force the next flush to write the remainder, even inside the interval:
+        # the frozen part must not be part of it.
+        self._sent_text = None
+        return self._sealed_count
 
     def flush(self, *, force: bool = False) -> bool:
         """Sync Telegram with the desired text. Returns True when something changed."""
@@ -538,19 +689,32 @@ class MessageStream:
             if elapsed < self.edit_interval:
                 return False
 
-        parts = chunk_message(self._text, self.limit) or [""]
+        tail = self._text[len(self._sealed_text) :]
+        parts = chunk_message(tail, self.limit, html=self.parse_mode == "HTML") or [""]
         changed = False
         for index, part in enumerate(parts):
-            if index < len(self._messages):
-                message = self._messages[index]
+            position = self._sealed_count + index
+            if position < len(self._messages):
+                message = self._messages[position]
                 if message.text == part:
                     continue
-                self.client.edit_message_text(message.chat_id, message.message_id, part)
+                self.client.edit_message_text(
+                    message.chat_id,
+                    message.message_id,
+                    part,
+                    parse_mode=self.parse_mode,
+                )
                 message.text = part
                 changed = True
             else:
                 markup = self.reply_markup if index == 0 else None
-                sent = self.client.send_message(self.chat_id, part, reply_markup=markup)
+                sent = self.client.send_message(
+                    self.chat_id,
+                    part,
+                    reply_markup=markup,
+                    parse_mode=self.parse_mode,
+                    message_thread_id=self.thread_id,
+                )
                 if not sent:  # pragma: no cover - dry-run/network failure path
                     break
                 result = sent[0]

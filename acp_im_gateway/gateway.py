@@ -15,7 +15,6 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Sequence
 
 from .access import AccessPolicy
@@ -23,6 +22,7 @@ from .acp import AcpClient, AcpError, AgentCapabilities, AgentCrashed, AcpTimeou
 from .approvals import ApprovalBridge
 from .config import Config
 from .containment import ContainmentError
+from .render import TurnView, heartbeat_notice
 from .router import (
     Binding,
     DiscoveryError,
@@ -31,6 +31,7 @@ from .router import (
     StateStore,
 )
 from .telegram import MessageStream, TelegramClient, TelegramError
+from .tiers import ApprovalTiers
 
 _logger = logging.getLogger("acp_im_gateway.gateway")
 
@@ -61,141 +62,6 @@ into a single message that is edited in place. Approvals appear as buttons.
 Direct messages only by default: group chats must be listed in ALLOWED_CHAT_IDS.
 """
 
-_STOP_MARKS = {
-    "end_turn": "✅ done",
-    "cancelled": "⏹️ cancelled",
-    "canceled": "⏹️ cancelled",
-    "max_tokens": "⚠️ stopped: token limit",
-    "max_turn_requests": "⚠️ stopped: request limit",
-    "refusal": "🚫 refused by the agent",
-}
-_TOOL_ICONS = {
-    "read": "📖",
-    "edit": "✏️",
-    "execute": "▶️",
-    "think": "💭",
-    "fetch": "🌐",
-    "search": "🔎",
-}
-
-
-def _content_text(content: Any) -> str:
-    """Extract text from an ACP content block (or a list of them)."""
-    if isinstance(content, Mapping):
-        if content.get("type") in (None, "text"):
-            return str(content.get("text") or "")
-        return ""
-    if isinstance(content, (list, tuple)):
-        return "".join(_content_text(item) for item in content)
-    if isinstance(content, str):
-        return content
-    return ""
-
-
-@dataclass
-class TurnView:
-    """Reduce a turn's ``session/update`` stream into one Telegram-friendly body.
-
-    Segments keep the agent's ordering: text runs and tool-call lines appear in
-    the order they happened. Tool lines are updated in place by tool-call id.
-    """
-
-    thought_chunks: int = 0
-    tool_calls: int = 0
-    placeholder: str = "💭 working…"
-    _segments: list[str] = field(default_factory=list)
-    _buffer: list[str] = field(default_factory=list)
-    _tool_segments: dict[str, int] = field(default_factory=dict)
-    _seen_tools: set[str] = field(default_factory=set)
-
-    # ------------------------------------------------------------------ reducing
-
-    def _flush_text(self) -> None:
-        if self._buffer:
-            text = "".join(self._buffer)
-            self._buffer.clear()
-            if text.strip():
-                self._segments.append(text)
-
-    def apply(self, notification: Mapping[str, Any]) -> None:
-        params = notification.get("params") or {}
-        update = params.get("update") or {}
-        if not isinstance(update, Mapping):
-            return
-        kind = str(update.get("sessionUpdate") or "")
-
-        if kind == "agent_message_chunk":
-            self._buffer.append(_content_text(update.get("content")))
-        elif kind == "agent_thought_chunk":
-            self.thought_chunks += 1
-        elif kind == "tool_call":
-            self._apply_tool_call(update)
-        elif kind == "tool_call_update":
-            self._apply_tool_call(update, is_update=True)
-        elif kind == "plan":
-            self._apply_plan(update)
-        # user_message_chunk / available_commands_update / current_mode_update /
-        # config_option_update and anything unknown are intentionally ignored.
-
-    def _apply_tool_call(self, update: Mapping[str, Any], *, is_update: bool = False) -> None:
-        tool_id = str(update.get("toolCallId") or update.get("id") or f"tool-{self.tool_calls}")
-        title = str(update.get("title") or "").strip()
-        kind = str(update.get("kind") or "").strip()
-        status = str(update.get("status") or "").strip()
-        icon = _TOOL_ICONS.get(kind.lower(), "🔧")
-
-        existing_index = self._tool_segments.get(tool_id)
-        if existing_index is None and is_update and tool_id in self._seen_tools:
-            return
-        if existing_index is not None:
-            previous = self._segments[existing_index]
-            if not title:
-                title = previous.split("[")[0].replace(icon, "").strip() or tool_id
-            line = f"{icon} {title} [{status or 'pending'}]"
-            if line != previous:
-                self._segments[existing_index] = line
-            return
-
-        self._flush_text()
-        if tool_id not in self._seen_tools:
-            self.tool_calls += 1
-            self._seen_tools.add(tool_id)
-        line = f"{icon} {title or tool_id} [{status or 'pending'}]"
-        self._tool_segments[tool_id] = len(self._segments)
-        self._segments.append(line)
-
-    def _apply_plan(self, update: Mapping[str, Any]) -> None:
-        entries = update.get("entries") or update.get("plan") or []
-        lines: list[str] = []
-        for entry in entries:
-            if not isinstance(entry, Mapping):
-                continue
-            status = str(entry.get("status") or entry.get("priority") or "")
-            mark = "✅" if status in ("completed", "done") else "▫️"
-            text = str(entry.get("content") or entry.get("text") or "").strip()
-            if text:
-                lines.append(f"{mark} {text}")
-        if not lines:
-            return
-        self._flush_text()
-        self._segments.append("📋 plan:\n" + "\n".join(lines))
-
-    # ------------------------------------------------------------------ rendering
-
-    def render(self) -> str:
-        parts = [segment for segment in self._segments if segment.strip()]
-        if self._buffer:
-            tail = "".join(self._buffer)
-            if tail.strip():
-                parts.append(tail)
-        body = "\n".join(parts).strip()
-        if body:
-            return body
-        if self.thought_chunks:
-            return f"💭 thinking… ({self.thought_chunks} chunk(s) of reasoning withheld)"
-        return self.placeholder
-
-
 class Gateway:
     """Long-polling Telegram gateway around one ACP agent process."""
 
@@ -224,6 +90,8 @@ class Gateway:
             pairing_ttl=config.pairing_ttl,
         )
         self.store = StateStore(config.state_file, log=self.log)
+        #: chat id -> forum topic id, so replies land in the thread they came from.
+        self._threads: dict[int, int] = {}
         self.router = Router(
             store=self.store,
             discovery=ProjectDiscovery(
@@ -237,11 +105,14 @@ class Gateway:
             allowed_roots=config.resolved_roots(),
             log=self.log,
         )
+        self.tiers = ApprovalTiers.from_config(config, log=self.log)
         self.approvals = ApprovalBridge(
             self.telegram,
             chat_for_session=self._chat_for_session,
             timeout=config.approval_timeout,
             log=self.log,
+            tiers=self.tiers,
+            chat_thread=self._thread_for,
         )
         self.acp = acp or AcpClient(
             config.agent_cmd,
@@ -362,6 +233,7 @@ class Gateway:
                 "I can only handle text messages (image and audio attachments are out of scope for v1).",
             )
             return
+        self._remember_thread(chat_id, message)
         text = str(text).strip()
         if not text:
             return
@@ -657,14 +529,33 @@ class Gateway:
             )
 
     def _execute_turn(self, chat_id: int, binding: Binding, text: str) -> None:
-        view = TurnView()
+        """Run one turn, rendering it as a CLI-like transcript.
+
+        The chat sees, in order: the start notice (⏳ project and model), every
+        command the agent ran verbatim with its real output, every file it wrote
+        or edited, the agent's reasoning (inside a spoiler), and the finish notice
+        (✅ with the test summary when a test command ran). Nothing extra is asked
+        of the user: the transcript is edited in place and, once a message would
+        pass ``GATEWAY_OVERFLOW_CHARS``, frozen and continued in a new one.
+        """
+        view = TurnView(
+            project=binding.project_name,
+            model=binding.model,
+            show_thinking=self.config.show_thinking,
+            tool_output_lines=self.config.tool_output_lines,
+        )
         stream = MessageStream(
             self.telegram,
             chat_id,
             edit_interval=self.config.edit_interval,
+            overflow_limit=self.config.overflow_chars,
+            parse_mode="HTML",
+            thread_id=self._thread_for(chat_id),
             log=self.log,
         )
-        if not self._stream_push(stream, view.render()):
+        started = self.clock()
+        turn = _TurnStream(self, stream, view, started)
+        if not turn.refresh():
             # Telegram is unreachable: do not spend a turn nobody would ever see.
             self.log.error("cannot reach Telegram for chat %s; skipping this turn", chat_id)
             self._reply(
@@ -683,8 +574,11 @@ class Gateway:
             except AcpError as exc:
                 if binding.session_id:
                     self._forget_live(binding.session_id)
-                error_text = f"⚠️ agent error: {exc}"
+                error_text = f"agent error: {exc}"
             else:
+                # The session is known now: name the project and the model up front.
+                view.start(binding.project_name, binding.model)
+                turn.refresh()
 
                 def on_update(notification: Mapping[str, Any]) -> None:
                     nonlocal error_text
@@ -692,41 +586,36 @@ class Gateway:
                         view.apply(notification)
                     except Exception:  # pragma: no cover - defensive: keep the turn alive
                         self.log.exception("failed to render a session/update")
-                        error_text = "⚠️ failed to render an agent update"
+                        error_text = "failed to render an agent update"
                         return
-                    self._stream_push(stream, view.render())
+                    turn.refresh()
 
                 try:
                     result = self.acp.prompt(
                         session_id,
                         text,
                         on_update=on_update,
-                        on_tick=lambda: self._stream_flush(stream),
+                        on_tick=turn.tick,
                         timeout=self.config.turn_timeout,
                     )
                     stop_reason = result.stop_reason
                 except AcpTimeout as exc:
                     error_text = f"⏱️ {exc}"
                 except AgentCrashed:
-                    error_text = (
-                        "💥 the agent crashed mid-turn; it is restarting. Send the prompt again."
-                    )
+                    error_text = "💥 the agent crashed mid-turn; it is restarting. Send the prompt again."
                 except AcpError as exc:
                     if binding.session_id:
                         self._forget_live(binding.session_id)
-                    error_text = f"⚠️ agent error: {exc}"
+                    error_text = f"agent error: {exc}"
 
-            final = view.render()
             if error_text:
-                final = f"{final}\n\n{error_text}" if final else error_text
+                view.fail(error_text)
             else:
-                mark = _STOP_MARKS.get(
-                    str(stop_reason), f"⏹️ stopped ({stop_reason or 'unknown'})"
-                )
-                if view.tool_calls:
-                    mark = f"{mark} · {view.tool_calls} tool call(s)"
-                final = f"{final}\n\n{mark}"
-            self._stream_close(stream, final)
+                view.finish(stop_reason, elapsed=self.clock() - started)
+            # The finish notice closes the last block: refresh once more so a full
+            # live message is frozen and the verdict opens a new one.
+            turn.refresh()
+            self._stream_close(stream, view.render())
         finally:
             # A turn that is over must not leave live approval buttons behind.
             self.approvals.cancel_chat(chat_id, "the turn ended")
@@ -747,6 +636,28 @@ class Gateway:
             stream.flush()
         except TelegramError as exc:
             self.log.error("Telegram edit failed for chat %s: %s", stream.chat_id, exc)
+
+    # ------------------------------------------------------------------ threads
+
+    def _remember_thread(self, chat_id: int, message: Mapping[str, Any]) -> None:
+        """Remember the forum topic a message came from, so replies stay in it."""
+        thread_id = message.get("message_thread_id")
+        if thread_id is None:
+            return
+        try:
+            value = int(thread_id)
+        except (TypeError, ValueError):
+            return
+        if self._threads.get(int(chat_id)) != value:
+            self._threads[int(chat_id)] = value
+            self.log.debug("chat %s is inside forum topic %s", chat_id, value)
+
+    def _thread_for(self, chat_id: int) -> int | None:
+        """The ``message_thread_id`` to reply with, or None outside a topic."""
+        try:
+            return self._threads.get(int(chat_id))
+        except (TypeError, ValueError):
+            return None
 
     def _stream_close(self, stream: MessageStream, text: str) -> None:
         try:
@@ -947,6 +858,93 @@ class Gateway:
 
     def _reply(self, chat_id: int, text: str) -> None:
         try:
-            self.telegram.send_message(chat_id, text, chunk=True)
+            self.telegram.send_message(
+                chat_id,
+                text,
+                chunk=True,
+                message_thread_id=self._thread_for(chat_id),
+            )
         except TelegramError as exc:
             self.log.error("sendMessage to chat %s failed: %s", chat_id, exc)
+
+
+class _TurnStream:
+    """Drive one turn's :class:`MessageStream`.
+
+    Two rules make the transcript read like the CLI instead of one giant edited
+    blob:
+
+    * once the live message would pass ``GATEWAY_OVERFLOW_CHARS``, it is frozen
+      (never edited again) and the next block starts a new message;
+    * when nothing visible changed for ``GATEWAY_HEARTBEAT_SECONDS``, a heartbeat
+      line with the elapsed time is refreshed, so "still working" is obvious
+      instead of looking hung.
+    """
+
+    def __init__(self, gateway: "Gateway", stream: MessageStream, view: TurnView, started: float) -> None:
+        self.gateway = gateway
+        self.stream = stream
+        self.view = view
+        self.started = started
+        self.body = ""
+        self.sealed_chars = 0
+        self.last_change = started
+        self.last_beat: float | None = None
+        self.heartbeat: str | None = None
+
+    @property
+    def elapsed(self) -> float:
+        return max(0.0, self.gateway.clock() - self.started)
+
+    def refresh(self) -> bool:
+        """Push the current transcript, freezing the message if it grew too long."""
+        body = self.view.render()
+        self.heartbeat = None  # new visible content: the pulse is no longer needed
+        # Freeze at the last point that cannot change again (whole blocks, plus
+        # whole lines of a text run). The forced flush is what makes it safe: the
+        # frozen message holds everything up to the freeze point, and ``seal``
+        # refuses while an edit is still pending, so nothing falls between them.
+        target = min(self.view.freeze_point(), len(self.body))
+        if self.body and target - self.sealed_chars > self.gateway.config.overflow_chars:
+            if self._freeze(self.body[:target]):
+                self.sealed_chars = target
+        self.body = body
+        self.last_change = self.gateway.clock()
+        return self.gateway._stream_push(self.stream, body)
+
+    def _freeze(self, upto: str) -> bool:
+        """Freeze the transcript exactly up to ``upto`` and start a new message.
+
+        The message is first written with *exactly* ``upto`` (a forced edit, even
+        inside the edit interval) and only then sealed: freezing text that is not
+        on screen yet would make the next message repeat it.
+        """
+        try:
+            self.stream.push(upto)
+            self.stream.flush(force=True)
+        except TelegramError as exc:
+            self.gateway.log.error(
+                "Telegram edit failed for chat %s: %s", self.stream.chat_id, exc
+            )
+            return False
+        if not self.stream.seal(upto):
+            return False
+        self.gateway.log.debug(
+            "froze the transcript at %d characters for chat %s", len(upto), self.stream.chat_id
+        )
+        return True
+
+    def tick(self) -> None:
+        """Called on every idle poll of the prompt loop: flush, then maybe beat."""
+        self.gateway._stream_flush(self.stream)
+        seconds = self.gateway.config.heartbeat_seconds
+        if seconds <= 0:
+            return
+        now = self.gateway.clock()
+        if now - self.last_change < seconds:
+            return
+        if self.last_beat is not None and now - self.last_beat < seconds:
+            return
+        self.last_beat = now
+        self.heartbeat = heartbeat_notice(now - self.started)
+        self.gateway._stream_push(self.stream, f"{self.body}\n\n{self.heartbeat}")

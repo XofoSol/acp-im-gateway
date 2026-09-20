@@ -188,3 +188,86 @@ def test_safe_table_redacts_the_token(projects_root: Path) -> None:
     assert "secret" not in " ".join(table.values())
     assert table["allowed_roots"] == str(projects_root)
     assert "DMs only" in table["allowed_chat_ids"]
+
+
+# --------------------------------------------------------------------------- v1.1 knobs
+
+
+def test_render_and_tier_defaults(tmp_path: Path) -> None:
+    from acp_im_gateway.tiers import DEFAULT_ALWAYS_ASK, DEFAULT_AUTO_ALLOW
+
+    config = Config.from_env(env={}, toml_path=_no_toml(tmp_path))
+    assert config.tool_output_lines == 15
+    assert config.overflow_chars == 3500
+    assert config.show_thinking is True
+    assert config.heartbeat_seconds == 60.0
+    assert config.auto_allow == DEFAULT_AUTO_ALLOW
+    assert config.always_ask == DEFAULT_ALWAYS_ASK
+    assert config.tier_overrides == {}
+    assert "git status" in config.auto_allow and "rm -rf" in config.always_ask
+
+
+def test_render_knobs_come_from_the_environment(tmp_path: Path) -> None:
+    config = Config.from_env(
+        env={
+            "GATEWAY_TOOL_OUTPUT_LINES": "3",
+            "GATEWAY_OVERFLOW_CHARS": "2000",
+            "GATEWAY_SHOW_THINKING": "off",
+            "GATEWAY_HEARTBEAT_SECONDS": "15",
+            "GATEWAY_AUTO_ALLOW": "git status, pytest",
+            "GATEWAY_ALWAYS_ASK": "",
+        },
+        toml_path=_no_toml(tmp_path),
+    )
+    assert config.tool_output_lines == 3
+    assert config.overflow_chars == 2000
+    assert config.show_thinking is False
+    assert config.heartbeat_seconds == 15.0
+    assert config.auto_allow == ("git status", "pytest")
+    assert config.always_ask == ()
+
+
+def test_tier_lists_and_per_chat_overrides_from_toml(tmp_path: Path) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text(
+        """
+[approvals]
+auto_allow = ["git status", "ls -la"]
+always_ask = ["rm -rf", "stripe"]
+
+[approvals.chats."42"]
+auto_allow = ["make build"]
+always_ask = []
+""",
+        encoding="utf-8",
+    )
+    config = Config.from_env(env={}, toml_path=toml)
+    assert config.auto_allow == ("git status", "ls -la")
+    assert config.always_ask == ("rm -rf", "stripe")
+    assert config.tier_overrides[42].auto_allow == ("make build",)
+    assert config.tier_overrides[42].always_ask == ()
+
+
+def test_per_chat_override_needs_a_numeric_chat_id(tmp_path: Path) -> None:
+    toml = tmp_path / "config.toml"
+    toml.write_text('[approvals.chats."not-a-chat"]\nauto_allow = ["ls"]\n', encoding="utf-8")
+    with pytest.raises(ConfigError, match="numeric chat id"):
+        Config.from_env(env={}, toml_path=toml)
+
+
+def test_render_validation_rejects_impossible_numbers() -> None:
+    with pytest.raises(ConfigError, match="GATEWAY_TOOL_OUTPUT_LINES"):
+        Config(telegram_bot_token="x", tool_output_lines=0).validate()
+    with pytest.raises(ConfigError, match="GATEWAY_OVERFLOW_CHARS"):
+        Config(telegram_bot_token="x", overflow_chars=100).validate()
+    with pytest.raises(ConfigError, match="GATEWAY_HEARTBEAT_SECONDS"):
+        Config(telegram_bot_token="x", heartbeat_seconds=-1).validate()
+
+
+def test_safe_table_lists_the_new_knobs() -> None:
+    rows = dict(Config(telegram_bot_token="secret").safe_table())
+    assert rows["tool_output_lines"] == "15"
+    assert rows["overflow_chars"] == "3500"
+    assert rows["show_thinking"] == "True"
+    assert "git status" in rows["auto_allow"]
+    assert "rm -rf" in rows["always_ask"]

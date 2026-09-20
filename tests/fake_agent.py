@@ -20,6 +20,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from typing import Any, Mapping
 
 #: Option ids the real agent's dispatch switch treats as an approval
@@ -231,15 +232,7 @@ class FakeAgent:
         self.notify_update(
             session_id, "agent_message_chunk", content={"type": "text", "text": f"echo: {text}"}
         )
-        self.notify_update(
-            session_id,
-            "tool_call",
-            toolCallId="call-1",
-            title="Run tests",
-            kind="execute",
-            status="pending",
-        )
-        self.notify_update(session_id, "tool_call_update", toolCallId="call-1", status="completed")
+        self.emit_tool_calls(session_id)
         emit(
             {
                 "jsonrpc": "2.0",
@@ -247,6 +240,10 @@ class FakeAgent:
                 "params": {"sessionId": session_id, "note": "ignored by the client"},
             }
         )
+
+        if self.args.slow:
+            # Hold the turn open so the gateway's heartbeat has something to do.
+            time.sleep(float(self.args.slow))
 
         if self.args.permission:
             self.permission_seq += 1
@@ -258,13 +255,7 @@ class FakeAgent:
                     "method": "session/request_permission",
                     "params": {
                         "sessionId": session_id,
-                        "toolCall": {
-                            "toolCallId": "call-1",
-                            "title": "Run the test suite",
-                            "kind": "execute",
-                            "status": "pending",
-                            "rawInput": {"command": "pytest -q"},
-                        },
+                        "toolCall": self.permission_tool_call(),
                         "options": [
                             {"optionId": "allow_once", "name": "Allow once", "kind": "allow_once"},
                             {"optionId": "allow_always", "name": "Always", "kind": "allow_always"},
@@ -289,6 +280,105 @@ class FakeAgent:
             return
 
         self.finish_prompt(session_id, "end_turn")
+
+    # ------------------------------------------------------------------ tool calls
+
+    def emit_tool_calls(self, session_id: str) -> None:
+        """Stream the tool calls this run is configured for.
+
+        Default (nothing configured) is the plain ``Run tests`` call the gateway
+        tests have always used. ``--tool-command`` streams a real shell call with
+        its command and output; ``--edit-path`` streams a file write with a diff.
+        """
+        if self.args.tool_command:
+            command = str(self.args.tool_command)
+            self.notify_update(
+                session_id,
+                "tool_call",
+                toolCallId="call-1",
+                title="Bash",
+                kind="execute",
+                status="in_progress",
+                rawInput={"command": command},
+            )
+            content = []
+            if self.args.tool_output:
+                content = [
+                    {
+                        "type": "content",
+                        "content": {"type": "text", "text": str(self.args.tool_output)},
+                    }
+                ]
+            self.notify_update(
+                session_id,
+                "tool_call_update",
+                toolCallId="call-1",
+                status="completed",
+                content=content,
+            )
+            return
+
+        if self.args.edit_path:
+            path = str(self.args.edit_path)
+            self.notify_update(
+                session_id,
+                "tool_call",
+                toolCallId="call-2",
+                title="Edit file",
+                kind="edit",
+                status="in_progress",
+                locations=[{"path": path}],
+                rawInput={"file_path": path},
+            )
+            self.notify_update(
+                session_id,
+                "tool_call_update",
+                toolCallId="call-2",
+                status="completed",
+                content=[
+                    {
+                        "type": "diff",
+                        "path": path,
+                        "oldText": "def answer():\n    return 1\n",
+                        "newText": "def answer():\n    return 42\n",
+                    }
+                ],
+            )
+            return
+
+        self.notify_update(
+            session_id,
+            "tool_call",
+            toolCallId="call-1",
+            title="Run tests",
+            kind="execute",
+            status="pending",
+        )
+        self.notify_update(session_id, "tool_call_update", toolCallId="call-1", status="completed")
+
+    def permission_tool_call(self) -> dict[str, Any]:
+        """The ``toolCall`` a permission request is about.
+
+        ``--permission-command`` describes a shell call (a bash payload);
+        ``--permission-generic`` describes a generic tool call with arguments and
+        no command string. The default is a command that matches neither of the
+        gateway's default approval tiers, so a tap is required.
+        """
+        if self.args.permission_generic:
+            return {
+                "toolCallId": "call-1",
+                "title": "Create a charge",
+                "kind": "other",
+                "status": "pending",
+                "rawInput": {"provider": "stripe", "amount": 500, "currency": "usd"},
+            }
+        return {
+            "toolCallId": "call-1",
+            "title": "Run the test suite",
+            "kind": "execute",
+            "status": "pending",
+            "rawInput": {"command": str(self.args.permission_command)},
+        }
 
     def finish_prompt(self, session_id: str, stop_reason: str) -> None:
         request_id = self.pending_prompts.pop(session_id, None)
@@ -415,6 +505,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load-session", action="store_true", help="advertise session/load")
     parser.add_argument("--junk", action="store_true", help="emit non-JSON stdout lines")
     parser.add_argument("--permission", action="store_true", help="ask permission mid-turn")
+    parser.add_argument(
+        "--permission-command",
+        default="npm test",
+        help="shell command the permission request is about (a bash payload)",
+    )
+    parser.add_argument(
+        "--permission-generic",
+        action="store_true",
+        help="ask permission for a generic tool call (arguments, no command string)",
+    )
+    parser.add_argument(
+        "--tool-command", default="", help="stream a shell tool call with this command"
+    )
+    parser.add_argument("--tool-output", default="", help="stdout for --tool-command")
+    parser.add_argument("--edit-path", default="", help="stream a file edit for this path")
+    parser.add_argument("--slow", type=float, default=0.0, help="hold the turn open this long")
     parser.add_argument("--unknown-request", action="store_true", help="send a request we must decline")
     parser.add_argument("--crash-on-prompt", action="store_true", help="die mid-turn")
     parser.add_argument("--exit-after", type=int, default=0, help="exit after N requests")

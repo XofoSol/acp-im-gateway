@@ -1,11 +1,18 @@
 """Approval bridge: ``session/request_permission`` -> Telegram buttons -> ACP response.
 
 The agent asks the *client* for permission before a gated tool call. The gateway
-turns that request into one Telegram message with inline buttons, keeps the ACP
-request open (``DEFER``), and answers it with the exact ``optionId`` the agent
-advertised once the user taps. A callback from an unauthorised user is refused.
-Unanswered approvals expire and are answered as ``cancelled`` — the bridge never
-lets the agent hang.
+answers it in one of two ways:
+
+* the approval tiers (:mod:`acp_im_gateway.tiers`) approve it silently when the
+  call is in ``auto_allow`` — no tap, logged at INFO with the reason — or force a
+  tap when it matches ``always_ask``, which is a code gate and wins over
+  ``auto_allow``;
+* otherwise one Telegram message with inline buttons, keeping the ACP request
+  open (``DEFER``) and answering it with the exact ``optionId`` the agent
+  advertised once the user taps.
+
+A callback from an unauthorised user is refused. Unanswered approvals expire and
+are answered as ``cancelled`` — the bridge never lets the agent hang.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from .acp import (
     permission_selected,
 )
 from .telegram import TelegramClient, TelegramError, inline_keyboard
+from .tiers import ApprovalDecision, ApprovalTiers, decide_request
 
 _logger = logging.getLogger("acp_im_gateway.approvals")
 
@@ -244,6 +252,8 @@ class ApprovalBridge:
         log: logging.Logger | None = None,
         token_factory: Callable[[], str] | None = None,
         max_open_per_chat: int = MAX_OPEN_PER_CHAT,
+        tiers: ApprovalTiers | None = None,
+        chat_thread: Callable[[int], int | None] | None = None,
     ) -> None:
         self.telegram = telegram
         self.chat_for_session = chat_for_session
@@ -252,6 +262,11 @@ class ApprovalBridge:
         self.log = log or _logger
         self.token_factory = token_factory or (lambda: secrets.token_hex(4))
         self.max_open_per_chat = max(1, int(max_open_per_chat))
+        #: Approval tiers: ``auto_allow`` approves silently, ``always_ask`` is a
+        #: code gate that forces a tap. ``None`` means "always ask".
+        self.tiers = tiers
+        #: Forum topics: reply into the same thread the chat is talking in.
+        self.chat_thread = chat_thread
         self.pending: dict[str, PendingApproval] = {}
         #: Guards ``pending``: it is touched by the ACP reader thread (new requests),
         #: background delivery threads, the polling loop (expiry) and turn threads.
@@ -277,6 +292,15 @@ class ApprovalBridge:
             )
             request.fail(-32601, "no chat is bound to this session")
             return DEFER
+
+        decision = decide_request(self.tiers, chat_id, parsed)
+        if decision is not None and decision.auto_approve:
+            if self._approve_without_a_tap(request, parsed, chat_id, decision):
+                return DEFER
+        elif decision is not None and decision.forced:
+            self.log.info(
+                "forced tap in chat %s for %s: %s", chat_id, parsed.title, decision.reason
+            )
 
         if self.open_count(chat_id) >= self.max_open_per_chat:
             self.log.warning("too many open approvals for chat %s; declining", chat_id)
@@ -305,6 +329,46 @@ class ApprovalBridge:
         ).start()
         return DEFER
 
+    def _approve_without_a_tap(
+        self,
+        request: InboundRequest,
+        parsed: PermissionRequest,
+        chat_id: int,
+        decision: ApprovalDecision,
+    ) -> bool:
+        """Answer the agent straight away (``auto_allow``). False -> ask instead."""
+        option = choose_allow_option(parsed)
+        if option is None:
+            self.log.warning(
+                "auto-approve wanted for %s in chat %s but the agent offered no allow "
+                "option; asking instead",
+                parsed.title,
+                chat_id,
+            )
+            return False
+        if not request.respond(permission_selected(option.option_id)):
+            self.log.warning(
+                "could not deliver the automatic approval for %s; asking instead", parsed.title
+            )
+            return False
+        self.log.info(
+            "auto-approved %s in chat %s as %r (%s)",
+            parsed.title,
+            chat_id,
+            option.option_id,
+            decision.reason,
+        )
+        return True
+
+    def _thread_for(self, chat_id: int) -> int | None:
+        if self.chat_thread is None:
+            return None
+        try:
+            return self.chat_thread(int(chat_id))
+        except Exception:  # pragma: no cover - defensive
+            self.log.debug("could not resolve a forum thread for chat %s", chat_id, exc_info=True)
+            return None
+
     def _deliver(self, approval: PendingApproval) -> None:
         """Send the buttons for a registered approval (background thread)."""
         try:
@@ -312,6 +376,7 @@ class ApprovalBridge:
                 approval.chat_id,
                 render_request(approval.request),
                 reply_markup=build_keyboard(approval.request, approval.token),
+                message_thread_id=self._thread_for(approval.chat_id),
             )
         except TelegramError as exc:
             self.log.error("cannot deliver approval prompt: %s", exc)
@@ -472,3 +537,19 @@ class ApprovalBridge:
 def option_labels(options: Sequence[PermissionOption]) -> list[str]:
     """Convenience for tests/logs."""
     return [option.name for option in options]
+
+
+def choose_allow_option(request: PermissionRequest) -> PermissionOption | None:
+    """The option to answer with when the tiers approve without a tap.
+
+    ``allow_once`` wins over ``allow_always``: a silent approval should not
+    persist a grant the user never saw.
+    """
+    allows = [option for option in request.ordered_options() if option.is_allow]
+    if not allows:
+        return None
+    for option in allows:
+        haystack = f"{option.kind} {option.option_id}".lower()
+        if "once" in haystack:
+            return option
+    return allows[0]

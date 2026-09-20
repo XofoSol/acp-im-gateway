@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 import pytest
@@ -305,3 +306,130 @@ def test_stream_splits_overflow_into_ordered_parts() -> None:
     clock.advance(2.0)
     stream.push(text + " tail")
     assert all(len(message.text) <= MAX_MESSAGE_LENGTH for message in telegram.sent())
+
+
+def test_stream_seal_freezes_the_message_and_starts_a_new_one() -> None:
+    telegram = FakeTelegram()
+    clock = FakeClock()
+    stream = make_stream(telegram, clock, edit_interval=0.0)
+    stream.push("first block")
+    assert len(telegram.sent()) == 1
+    assert stream.seal() == 1
+
+    stream.push("first block\n\nsecond block")
+    sent = telegram.sent()
+    assert len(sent) == 2, "a sealed message is never reused"
+    assert sent[0].text == "first block"
+    assert sent[1].text == "\n\nsecond block"
+    assert stream.sealed_text == "first block"
+    assert [message.message_id for message in stream.sealed_messages] == [sent[0].message_id]
+
+    clock.advance(5.0)
+    stream.push("first block\n\nsecond block\n\nthird")
+    # The sealed message keeps its frozen text; the live one is edited in place.
+    current = {message.message_id: message.text for message in telegram.messages}
+    assert current[sent[0].message_id] == "first block"
+    assert current[sent[1].message_id] == "\n\nsecond block\n\nthird"
+
+
+def test_stream_seal_is_a_noop_when_nothing_is_on_screen_yet() -> None:
+    telegram = FakeTelegram()
+    stream = make_stream(telegram, FakeClock())
+    assert stream.seal() == 0
+    stream.push("hello")
+    assert stream.up_to_date is True
+    assert stream.live_message_id == stream.message_id
+
+
+def test_stream_seal_refuses_while_an_edit_is_pending() -> None:
+    """Freezing stale content would drop whatever the pending edit carried."""
+    telegram = FakeTelegram()
+    clock = FakeClock()
+    stream = make_stream(telegram, clock, edit_interval=10.0)
+    stream.push("shown")
+    stream.push("shown plus something newer")  # coalesced: not on screen yet
+    assert stream.up_to_date is False
+    assert stream.seal() == 0
+    assert len(stream.sealed_messages) == 0
+
+    clock.advance(20.0)
+    stream.flush()
+    assert stream.up_to_date is True
+    assert stream.seal() == 1
+
+
+def test_stream_close_flushes_the_tail_into_the_new_message() -> None:
+    telegram = FakeTelegram()
+    clock = FakeClock()
+    stream = make_stream(telegram, clock, edit_interval=0.0)
+    stream.push("block one")
+    stream.seal()
+    stream.push("block one\n\nblock two")
+    clock.advance(5.0)
+    stream.close("block one\n\nblock two\n\n✅ done")
+    sent = telegram.sent()
+    assert len(sent) == 2
+    current = {message.message_id: message.text for message in telegram.messages}
+    assert current[sent[0].message_id] == "block one"
+    assert current[sent[1].message_id] == "\n\nblock two\n\n✅ done"
+
+
+def test_html_chunking_keeps_tags_balanced_and_content_intact() -> None:
+    text = (
+        "<tg-spoiler>" + "reasoning " * 400 + "</tg-spoiler>\n\n"
+        "<pre>" + "\n".join(f"line {index}" for index in range(500)) + "</pre>"
+    )
+    parts = chunk_message(text, html=True)
+    assert len(parts) > 1
+    assert all(len(part) <= MAX_MESSAGE_LENGTH for part in parts)
+    from acp_im_gateway.telegram import scan_html
+
+    assert all(scan_html(part) == () for part in parts)
+    strip = lambda chunk: re.sub(  # noqa: E731
+        r"</?(?:pre|code|b|i|u|s|tg-spoiler|blockquote)(?:\s[^>]*)?>", "", chunk
+    )
+    assert strip("".join(parts)) == strip(text)
+
+
+def test_html_chunking_keeps_nested_tags_balanced() -> None:
+    text = (
+        "<tg-spoiler><pre>"
+        + "".join(f"line {index} " * 12 + "\n" for index in range(300))
+        + "</pre></tg-spoiler>"
+    )
+    parts = chunk_message(text, html=True)
+    assert len(parts) > 1
+    assert all(len(part) <= MAX_MESSAGE_LENGTH for part in parts)
+    from acp_im_gateway.telegram import scan_html
+
+    assert all(scan_html(part) == () for part in parts)
+    # No part ends in the middle of a tag, which Telegram would reject.
+    assert not any(re.search(r"</?[a-z-]*$", part) for part in parts)
+
+
+def test_html_chunking_rejects_a_limit_it_cannot_honour() -> None:
+    with pytest.raises(ValueError, match="limit must be"):
+        chunk_message("x" * 1000, limit=10, html=True)
+
+
+def test_stream_seal_can_freeze_a_prefix_of_what_was_pushed() -> None:
+    """Freezing *less* than what was pushed must not repeat the difference."""
+    telegram = FakeTelegram()
+    clock = FakeClock()
+    stream = make_stream(telegram, clock, edit_interval=0.0)
+    full = "header\n\nbody starts here"
+    stream.push(full)
+    assert telegram.current_text(111) == full
+
+    frozen = "header"
+    stream.push(frozen)
+    stream.flush(force=True)
+    assert stream.seal(frozen) == 1
+    assert stream.sealed_text == frozen
+
+    stream.push(full + "\n\nand more")
+    current = {message.message_id: message.text for message in telegram.messages}
+    sent = telegram.sent()
+    assert current[sent[0].message_id] == frozen
+    assert current[sent[1].message_id] == "\n\nbody starts here\n\nand more", "no duplication"
+    assert (current[sent[0].message_id] + current[sent[1].message_id]) == full + "\n\nand more"

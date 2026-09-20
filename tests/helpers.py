@@ -1,13 +1,21 @@
-"""Shared test helpers: an in-memory Telegram double, a fake clock and waiting."""
+"""Shared test helpers: doubles, a fake clock, waiting and the gateway harness.
+
+Everything here is hermetic: :class:`FakeTelegram` never touches the network and
+the agent side is ``fake_agent.py`` on stdio. No test ever sends a
+``session/prompt`` to a real agent.
+"""
 
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:  # make `import acp_im_gateway` work from a checkout
@@ -16,7 +24,13 @@ if str(REPO_ROOT) not in sys.path:  # make `import acp_im_gateway` work from a c
 FAKE_AGENT = REPO_ROOT / "tests" / "fake_agent.py"
 PYTHON = sys.executable
 
-from acp_im_gateway.telegram import MAX_MESSAGE_LENGTH, chunk_message  # noqa: E402
+from acp_im_gateway.config import Config  # noqa: E402
+from acp_im_gateway.gateway import Gateway  # noqa: E402
+from acp_im_gateway.telegram import chunk_message  # noqa: E402
+
+LOG = logging.getLogger("tests.harness")
+CHAT = 111
+USER = 900
 
 
 # --------------------------------------------------------------------------- clock
@@ -52,6 +66,8 @@ class RecordedMessage:
     message_id: int
     text: str
     reply_markup: Mapping[str, Any] | None = None
+    parse_mode: str | None = None
+    message_thread_id: int | None = None
     seq: int = 0
 
 
@@ -125,13 +141,24 @@ class FakeTelegram:
     ) -> list[dict[str, Any]]:
         if self.fail_send is not None:
             raise self.fail_send
-        pieces = chunk_message(text) if chunk else [text]
+        parse_mode = kwargs.get("parse_mode")
+        thread_id = kwargs.get("message_thread_id")
+        pieces = chunk_message(text, html=parse_mode == "HTML") if chunk else [text]
         out: list[dict[str, Any]] = []
         for index, piece in enumerate(pieces):
             self._next_id += 1
             markup = reply_markup if index == 0 else None
             self.calls.append(
-                ("sendMessage", {"chat_id": chat_id, "text": piece, "reply_markup": markup})
+                (
+                    "sendMessage",
+                    {
+                        "chat_id": chat_id,
+                        "text": piece,
+                        "reply_markup": markup,
+                        "parse_mode": parse_mode,
+                        "message_thread_id": thread_id,
+                    },
+                )
             )
             record = RecordedMessage(
                 method="sendMessage",
@@ -139,6 +166,8 @@ class FakeTelegram:
                 message_id=self._next_id,
                 text=piece,
                 reply_markup=markup,
+                parse_mode=parse_mode,
+                message_thread_id=thread_id,
                 seq=self._bump(),
             )
             self.messages.append(record)
@@ -159,8 +188,17 @@ class FakeTelegram:
             raise self.fail_edit
         chat_id = int(chat_id)
         message_id = int(message_id)
+        parse_mode = kwargs.get("parse_mode")
         self.calls.append(
-            ("editMessageText", {"chat_id": chat_id, "message_id": message_id, "text": text})
+            (
+                "editMessageText",
+                {
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "text": text,
+                    "parse_mode": parse_mode,
+                },
+            )
         )
         record = RecordedMessage(
             method="editMessageText",
@@ -168,6 +206,7 @@ class FakeTelegram:
             message_id=message_id,
             text=text,
             reply_markup=reply_markup,
+            parse_mode=parse_mode,
             seq=self._bump(),
         )
         self.edits_log.append(record)
@@ -176,6 +215,7 @@ class FakeTelegram:
                 existing.method = "editMessageText"
                 existing.text = text
                 existing.reply_markup = reply_markup
+                existing.parse_mode = parse_mode
                 existing.seq = record.seq
                 break
         else:  # pragma: no cover - editing a message we never sent
@@ -220,17 +260,19 @@ def message_update(
     chat_type: str = "private",
     update_id: int = 1,
     username: str = "tester",
+    message_thread_id: int | None = None,
 ) -> dict[str, Any]:
-    return {
-        "update_id": update_id,
-        "message": {
-            "message_id": update_id,
-            "date": 0,
-            "chat": {"id": chat_id, "type": chat_type},
-            "from": {"id": user_id, "username": username, "is_bot": False},
-            "text": text,
-        },
+    message: dict[str, Any] = {
+        "message_id": update_id,
+        "date": 0,
+        "chat": {"id": chat_id, "type": chat_type},
+        "from": {"id": user_id, "username": username, "is_bot": False},
+        "text": text,
     }
+    if message_thread_id is not None:
+        message["message_thread_id"] = message_thread_id
+        message["is_topic_message"] = True
+    return {"update_id": update_id, "message": message}
 
 
 def callback_update(
@@ -278,6 +320,16 @@ def wait_until(predicate: Callable[[], bool], *, timeout: float = 8.0, interval:
     return bool(predicate())
 
 
+def html_text(fake: FakeTelegram, chat_id: int, message_id: int | None = None) -> str:
+    """The newest visible text of a chat (or of one message)."""
+    relevant = [message for message in fake.messages if message.chat_id == chat_id]
+    if message_id is not None:
+        relevant = [message for message in relevant if message.message_id == message_id]
+    if not relevant:
+        return ""
+    return max(relevant, key=lambda message: message.seq).text
+
+
 def read_agent_log(path: Path) -> list[dict[str, Any]]:
     """Parse the fake agent's JSON-lines log."""
     if not Path(path).is_file():
@@ -307,3 +359,125 @@ def make_project(parent: Path, name: str, *, git: bool = True) -> Path:
     if git:
         (path / ".git").mkdir(exist_ok=True)
     return path
+
+
+# --------------------------------------------------------------------------- harness
+
+
+@dataclass
+class Harness:
+    """A gateway wired to the fake agent and the in-memory Telegram double."""
+
+    gateway: Gateway
+    telegram: FakeTelegram
+    log_path: Path
+    chat_id: int = CHAT
+
+    # -- driving ---------------------------------------------------------------
+
+    def send(self, text: str, **kwargs: Any) -> None:
+        kwargs.setdefault("chat_id", self.chat_id)
+        kwargs.setdefault("user_id", USER)
+        self.gateway.handle_update(message_update(text, **kwargs))
+
+    def callback(self, data: str, **kwargs: Any) -> None:
+        kwargs.setdefault("chat_id", self.chat_id)
+        kwargs.setdefault("user_id", USER)
+        self.gateway.handle_update(callback_update(data, **kwargs))
+
+    # -- inspecting ------------------------------------------------------------
+
+    @property
+    def runtime(self) -> Any:
+        return self.gateway.router.runtime(self.chat_id)
+
+    def replies(self) -> list[str]:
+        return self.telegram.texts(self.chat_id)
+
+    def last_reply(self) -> str:
+        sent = self.telegram.sent(self.chat_id)
+        return sent[-1].text if sent else ""
+
+    def current_text(self) -> str:
+        return self.telegram.current_text(self.chat_id) or ""
+
+    def agent_events(self) -> list[dict[str, Any]]:
+        return read_agent_log(self.log_path)
+
+    def agent_requests(self, method: str) -> list[dict[str, Any]]:
+        """JSON-RPC requests the agent received, by method."""
+        return [
+            event
+            for event in self.agent_events()
+            if event.get("event") == "request" and event.get("method") == method
+        ]
+
+    def prompts(self) -> list[dict[str, Any]]:
+        """Prompts the agent received, with the text exactly as it arrived."""
+        return events_named(self.agent_events(), "prompt")
+
+    def any_text(self, needle: str) -> bool:
+        return any(
+            needle in message.text
+            for message in self.telegram.messages
+            if message.chat_id == self.chat_id
+        )
+
+    def all_text(self) -> str:
+        """Every message this chat has ever shown (sends and edits, in order)."""
+        return "\n".join(message.text for message in self.telegram.messages)
+
+    def visible_text(self) -> str:
+        """The chat as the owner sees it: every message in order, current state."""
+        return "\n".join(
+            message.text for message in self.telegram.messages if message.chat_id == self.chat_id
+        )
+
+    def permission_responses(self) -> list[dict[str, Any]]:
+        return events_named(self.agent_events(), "permission_response")
+
+    def permission_decisions(self) -> list[dict[str, Any]]:
+        return events_named(self.agent_events(), "permission_decision")
+
+    def buttons(self) -> list[dict[str, Any]]:
+        return approval_buttons(self.telegram, self.chat_id)
+
+    def wait_idle(self, timeout: float = 10.0) -> bool:
+        return wait_until(lambda: not self.runtime.busy, timeout=timeout)
+
+    def wait_for_buttons(self, timeout: float = 10.0) -> bool:
+        return wait_until(lambda: bool(self.buttons()), timeout=timeout)
+
+    def state(self) -> dict[str, Any]:
+        return json.loads(self.gateway.store.path.read_text(encoding="utf-8"))
+
+
+@pytest.fixture()
+def make_harness(tmp_path: Path, config: Config) -> Iterator[Callable[..., Harness]]:
+    """Build gateways around the scriptable fake agent; stop them afterwards."""
+    created: list[Gateway] = []
+
+    def factory(
+        *agent_flags: str,
+        allowed_users: Sequence[int] = (USER,),
+        allowed_chats: Sequence[int] = (),
+        chat_id: int = CHAT,
+        **overrides: Any,
+    ) -> Harness:
+        log_path = tmp_path / f"agent-{len(created)}.jsonl"
+        cfg = replace(
+            config,
+            agent_cmd=(PYTHON, str(FAKE_AGENT), "--log", str(log_path), *agent_flags),
+            allowed_user_ids=frozenset(allowed_users),
+            allowed_chat_ids=frozenset(allowed_chats),
+            **overrides,
+        )
+        telegram = FakeTelegram()
+        gateway = Gateway(cfg, telegram=telegram, log=LOG)
+        gateway.start()
+        created.append(gateway)
+        return Harness(gateway=gateway, telegram=telegram, log_path=log_path, chat_id=chat_id)
+
+    yield factory
+    for gateway in created:
+        gateway.stop()

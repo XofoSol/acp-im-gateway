@@ -6,138 +6,22 @@ agent: the ACP side is the scriptable fake in ``tests/fake_agent.py``.
 
 from __future__ import annotations
 
-import json
 import logging
 import re
-from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import pytest
 
 from acp_im_gateway.acp import STEER_METHOD
-from acp_im_gateway.config import Config
-from acp_im_gateway.gateway import Gateway, TurnView
+from acp_im_gateway.gateway import TurnView
 
 from .helpers import (
-    FAKE_AGENT,
-    PYTHON,
-    FakeTelegram,
-    approval_buttons,
-    callback_update,
+    CHAT,
     events_named,
-    message_update,
-    read_agent_log,
+    make_harness,  # noqa: F401  (pytest fixture: used by name in the signatures)
     wait_until,
 )
-
-LOG = logging.getLogger("tests.gateway")
-CHAT = 111
-USER = 900
-
-
-@dataclass
-class Harness:
-    gateway: Gateway
-    telegram: FakeTelegram
-    log_path: Path
-    chat_id: int = CHAT
-
-    # -- driving ---------------------------------------------------------------
-
-    def send(self, text: str, **kwargs: Any) -> None:
-        kwargs.setdefault("chat_id", self.chat_id)
-        kwargs.setdefault("user_id", USER)
-        self.gateway.handle_update(message_update(text, **kwargs))
-
-    def callback(self, data: str, **kwargs: Any) -> None:
-        kwargs.setdefault("chat_id", self.chat_id)
-        kwargs.setdefault("user_id", USER)
-        self.gateway.handle_update(callback_update(data, **kwargs))
-
-    # -- inspecting ------------------------------------------------------------
-
-    @property
-    def runtime(self) -> Any:
-        return self.gateway.router.runtime(self.chat_id)
-
-    def replies(self) -> list[str]:
-        return self.telegram.texts(self.chat_id)
-
-    def last_reply(self) -> str:
-        sent = self.telegram.sent(self.chat_id)
-        return sent[-1].text if sent else ""
-
-    def current_text(self) -> str:
-        return self.telegram.current_text(self.chat_id) or ""
-
-    def agent_events(self) -> list[dict[str, Any]]:
-        return read_agent_log(self.log_path)
-
-    def agent_requests(self, method: str) -> list[dict[str, Any]]:
-        """JSON-RPC requests the agent received, by method."""
-        return [
-            event
-            for event in self.agent_events()
-            if event.get("event") == "request" and event.get("method") == method
-        ]
-
-    def prompts(self) -> list[dict[str, Any]]:
-        """Prompts the agent received, with the text exactly as it arrived."""
-        return events_named(self.agent_events(), "prompt")
-
-    def any_text(self, needle: str) -> bool:
-        return any(
-            needle in message.text
-            for message in self.telegram.messages
-            if message.chat_id == self.chat_id
-        )
-
-    def permission_responses(self) -> list[dict[str, Any]]:
-        return events_named(self.agent_events(), "permission_response")
-
-    def buttons(self) -> list[dict[str, Any]]:
-        return approval_buttons(self.telegram, self.chat_id)
-
-    def wait_idle(self, timeout: float = 10.0) -> bool:
-        return wait_until(lambda: not self.runtime.busy, timeout=timeout)
-
-    def wait_for_buttons(self, timeout: float = 10.0) -> bool:
-        return wait_until(lambda: bool(self.buttons()), timeout=timeout)
-
-    def state(self) -> dict[str, Any]:
-        return json.loads(self.gateway.store.path.read_text(encoding="utf-8"))
-
-
-@pytest.fixture()
-def make_harness(tmp_path: Path, config: Config) -> Any:
-    created: list[Gateway] = []
-
-    def factory(
-        *agent_flags: str,
-        allowed_users: Sequence[int] = (USER,),
-        allowed_chats: Sequence[int] = (),
-        chat_id: int = CHAT,
-        **overrides: Any,
-    ) -> Harness:
-        log_path = tmp_path / f"agent-{len(created)}.jsonl"
-        cfg = replace(
-            config,
-            agent_cmd=(PYTHON, str(FAKE_AGENT), "--log", str(log_path), *agent_flags),
-            allowed_user_ids=frozenset(allowed_users),
-            allowed_chat_ids=frozenset(allowed_chats),
-            **overrides,
-        )
-        telegram = FakeTelegram()
-        gateway = Gateway(cfg, telegram=telegram, log=LOG)
-        gateway.start()
-        created.append(gateway)
-        return Harness(gateway=gateway, telegram=telegram, log_path=log_path, chat_id=chat_id)
-
-    yield factory
-    for gateway in created:
-        gateway.stop()
-
 
 # --------------------------------------------------------------------------- access
 
