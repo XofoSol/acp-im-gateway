@@ -704,23 +704,6 @@ def shell_commands(text: str) -> list[str]:
     return [part.strip() for part in _SPLIT_OPERATORS.split(text or "") if part.strip()]
 
 
-def command_head(command: str, tokens: Sequence[str]) -> bool:
-    """True when ``command`` starts with ``tokens`` (``git status`` matches ``git status -s``).
-
-    Only ``VAR=value`` prefixes are skipped. Wrappers such as ``sudo`` are *not*:
-    ``sudo cat /etc/shadow`` must not inherit ``cat``'s whitelist entry.
-    """
-    for simple in shell_commands(command):
-        parts = _split_tokens(simple)
-        index = 0
-        while index < len(parts) and _is_env_assignment(parts[index]):
-            index += 1
-        head = [part.lower() for part in parts[index : index + len(tokens)]]
-        if len(head) == len(tokens) and head == [token.lower() for token in tokens]:
-            return True
-    return False
-
-
 def _split_tokens(command: str) -> list[str]:
     import shlex
 
@@ -728,10 +711,6 @@ def _split_tokens(command: str) -> list[str]:
         return shlex.split(command, posix=True)
     except ValueError:
         return command.split()
-
-
-def _is_env_assignment(token: str) -> bool:
-    return "=" in token and not token.startswith("-") and not token.startswith("/")
 
 
 def _invocation(parts: Sequence[str]) -> list[str] | None:

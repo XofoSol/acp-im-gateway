@@ -31,7 +31,7 @@ from .router import (
     StateStore,
 )
 from .telegram import MessageStream, TelegramClient, TelegramError
-from .tiers import ApprovalTiers
+from .tiers import ApprovalTiers, normalize_posture
 
 _logger = logging.getLogger("acp_im_gateway.gateway")
 
@@ -40,6 +40,7 @@ BOT_COMMANDS: tuple[tuple[str, str], ...] = (
     ("bind", "Bind this chat to a project: /bind <name> [<path>]"),
     ("new", "Start a fresh session in this chat's project"),
     ("stop", "Cancel the running turn and drop queued messages"),
+    ("aprobar", "Approval posture for this chat: /aprobar preguntar|auto"),
     ("status", "Show project, session, model, approval posture and queue"),
     ("unbind", "Forget the binding for this chat"),
     ("help", "Show this help"),
@@ -52,6 +53,7 @@ Commands
   /bind <name> [<path>]  bind this chat to a project
   /new                 start a fresh session in this chat's project
   /stop                cancel the running turn (drops queued messages)
+  /aprobar <postura>   this chat's posture: preguntar | auto
   /status              project, session, model, approval posture, queue
   /unbind              forget this chat's binding
   /help                this message
@@ -59,8 +61,19 @@ Commands
 Anything else you type is sent verbatim to the agent, and its reply is streamed
 into a single message that is edited in place. Approvals appear as buttons.
 
+Approval postures (per chat)
+  preguntar  a tap for anything that is not a harmless read-only command
+  auto       silent for anything that is not in always_ask (the money gate)
+  The agent always stays in `ask`: the gateway is the only gatekeeper, so the
+  money gate always sees the request.
+
 Direct messages only by default: group chats must be listed in ALLOWED_CHAT_IDS.
 """
+
+#: The agent's own ``tool_approval`` posture is pinned here, forever. Loosening it
+#: would stop the permission requests arriving, so ``always_ask`` would never see
+#: them and money could be spent silently. Only the gateway answers requests.
+AGENT_POSTURE = "ask"
 
 class Gateway:
     """Long-polling Telegram gateway around one ACP agent process."""
@@ -139,6 +152,8 @@ class Gateway:
         if self._started:
             return
         self.router.load()
+        # A persisted /aprobar posture is honoured from the first message on.
+        self._sync_postures()
         self._started = True
         if not self.config.dry_run:
             self.telegram.set_my_commands(BOT_COMMANDS)
@@ -272,6 +287,7 @@ class Gateway:
             "bind": lambda cid, cmd_args: self._cmd_bind(cid, cmd_args),
             "new": lambda cid, _args: self._cmd_new(cid),
             "stop": lambda cid, _args: self._cmd_stop(cid),
+            "aprobar": lambda cid, cmd_args: self._cmd_aprobar(cid, cmd_args),
             "status": lambda cid, _args: self._cmd_status(cid),
             "unbind": lambda cid, _args: self._cmd_unbind(cid),
         }
@@ -357,7 +373,7 @@ class Gateway:
         self._reply(
             chat_id,
             f"🆕 Fresh session {session_id[:8]} in {binding.project_root}.\n"
-            f"model {binding.model or '?'} · approval {binding.approval or '?'}",
+            f"model {binding.model or '?'} · approval posture {binding.posture}",
         )
 
     def _cmd_stop(self, chat_id: int) -> None:
@@ -378,6 +394,60 @@ class Gateway:
             return ""
         return f" Dropped {dropped} queued message(s)."
 
+    def _cmd_aprobar(self, chat_id: int, args: Sequence[str]) -> None:
+        """``/aprobar preguntar|auto`` — this chat's gateway posture, applied now.
+
+        Only the *gateway's* answer changes. The agent is left in ``ask`` on
+        purpose: if it stopped asking, the ``always_ask`` money gate would never
+        see the call.
+        """
+        binding = self.router.get(chat_id)
+        if binding is None:
+            self._reply(chat_id, self._no_binding_text())
+            return
+        if not args:
+            self._reply(
+                chat_id,
+                f"Approval posture for this chat: {self._chat_posture(chat_id)}\n"
+                "Usage: /aprobar preguntar | /aprobar auto\n"
+                "  preguntar  a tap for anything that is not harmless read-only\n"
+                "  auto       silent for anything that is not in always_ask\n"
+                "The agent stays in 'ask' either way: the gateway is the gatekeeper.",
+            )
+            return
+        requested = args[0].strip().lower()
+        if requested not in ("preguntar", "ask", "auto", "yolo"):
+            self._reply(
+                chat_id,
+                f"Unknown posture {args[0]!r}. Use /aprobar preguntar or /aprobar auto.",
+            )
+            return
+        posture = self.tiers.set_posture(chat_id, requested)
+        self.router.set_approval(chat_id, posture)
+        if posture == "auto":
+            detail = "silent now, except for always_ask (money/irreversible), which still taps"
+        else:
+            detail = "a tap for anything that is not a harmless read-only command"
+        label = "preguntar" if posture == "ask" else "auto"
+        self._reply(
+            chat_id,
+            f"✅ Approval posture for this chat: {label} — {detail}.\n"
+            "The agent stays in 'ask': the gateway is the only gatekeeper.",
+        )
+        self.log.info("chat %s approval posture -> %s", chat_id, posture)
+
+    def _chat_posture(self, chat_id: int) -> str:
+        """The effective posture for a chat: its ``/aprobar`` value or the default."""
+        return normalize_posture(self.tiers.posture_for(chat_id))
+
+    def _sync_postures(self) -> None:
+        """Push persisted per-chat postures into the tiers (after a state load)."""
+        for chat_id, binding in self.router.bindings.items():
+            if binding.approval:
+                self.tiers.set_posture(chat_id, binding.approval)
+            else:
+                self.tiers.clear_posture(chat_id)
+
     def _cmd_status(self, chat_id: int) -> None:
         binding = self.router.get(chat_id)
         runtime = self.router.runtime(chat_id)
@@ -388,6 +458,10 @@ class Gateway:
         ]
         if binding is None:
             lines.append("project: (not bound) — see /projects")
+            lines.append(
+                f"approval posture: {self._chat_posture(chat_id)} "
+                "(agent stays ask; gateway is the gatekeeper)"
+            )
         else:
             lines.append(f"project: {binding.project_name} — {binding.project_root}")
             live = binding.session_id in self._live_sessions if binding.session_id else False
@@ -396,7 +470,10 @@ class Gateway:
                 f"({'live in this process' if live else 'will resume on the next message' if binding.session_id else 'none yet'})"
             )
             lines.append(f"model: {binding.model or '?'} · mode: {binding.mode or '?'}")
-            lines.append(f"approval posture: {binding.approval or 'ask'}")
+            lines.append(
+                f"approval posture: {self._chat_posture(chat_id)} "
+                "(agent stays ask; gateway is the gatekeeper)"
+            )
         lines.append(f"agent: {'running' if self.acp.running else 'stopped'} (pid {self.acp.pid})")
         if caps is not None:
             lines.append(
@@ -728,30 +805,32 @@ class Gateway:
     def _record_session(self, chat_id: int, binding: Binding, session: Any) -> None:
         model = session.model if hasattr(session, "model") else None
         mode = None
-        approval = session.approval_posture if hasattr(session, "approval_posture") else None
         raw = getattr(session, "raw", None)
         if isinstance(raw, Mapping):
             modes = raw.get("modes")
             if isinstance(modes, Mapping):
                 mode = modes.get("currentModeId")
+        # ``binding.approval`` is the *chat* posture (``/aprobar``), not the
+        # agent's, so it is deliberately not overwritten here.
         self.router.set_session(
             chat_id,
             session.session_id,
             model=str(model) if model is not None else None,
             mode=str(mode) if mode is not None else None,
-            approval=str(approval) if approval is not None else None,
         )
 
     def _apply_approval_posture(self, chat_id: int, session_id: str, session: Any) -> None:
-        """Ask for the configured ``tool_approval`` posture when it differs.
+        """Pin the agent's ``tool_approval`` posture to ``ask``, never wider.
 
-        The spec's default is ``ask``. The reference agent already defaults to it,
-        so this is a no-op there; if the option is missing (or the agent refuses the
-        call) the agent's own posture stays in charge and we say so in the log.
+        The gateway answers every permission request itself: silently for
+        ``auto_allow``, with a tap for ``always_ask``, and per the chat's
+        ``/aprobar`` posture for everything else. Loosening the *agent* to ``auto``
+        would stop the requests arriving at all, so ``always_ask`` would never see
+        them and money could be spent silently — the exact failure this guards
+        against. If the agent does not expose the option (or refuses the call) the
+        log says so and its own posture stays in charge.
         """
-        desired = self.config.approval_posture
-        if not desired:
-            return
+        desired = AGENT_POSTURE
         option = session.option("tool_approval") if hasattr(session, "option") else None
         if option is None:
             return
@@ -762,15 +841,14 @@ class Gateway:
             self.acp.set_config_option(session_id, "tool_approval", desired)
         except AcpError as exc:
             self.log.info(
-                "could not set tool_approval=%s on session %s (%s); keeping %r",
+                "could not pin tool_approval=%s on session %s (%s); keeping %r",
                 desired,
                 session_id[:8],
                 exc,
                 current,
             )
             return
-        self.log.info("tool_approval set to %s for session %s", desired, session_id[:8])
-        self.router.set_session(chat_id, session_id, approval=desired)
+        self.log.info("tool_approval pinned to %s for session %s", desired, session_id[:8])
 
     def _newest_session(self, cwd: str) -> SessionInfo | None:
         try:
@@ -844,6 +922,7 @@ class Gateway:
         if not changed:
             return
         self.log.info("allowlist updated from the state file")
+        self._sync_postures()
         for request in self.access.pending_requests():
             if request.approved_at is None or request.notified:
                 continue

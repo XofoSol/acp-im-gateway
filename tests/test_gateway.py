@@ -361,17 +361,142 @@ def test_turn_loop_reports_dropped_messages_after_an_internal_error(make_harness
     assert "Dropped 2 queued message(s)" in harness.last_reply()
 
 
-def test_approval_posture_is_requested_when_it_differs(make_harness: Any) -> None:
+def test_the_agent_posture_is_pinned_to_ask_the_gateway_is_the_only_gatekeeper(
+    make_harness: Any,
+) -> None:
+    """v1.2 §2: never loosen the agent's ``tool_approval`` posture.
+
+    If the agent stopped asking, ``always_ask`` would never see the call and money
+    could be spent silently. So neither a widening gateway posture nor ``/aprobar
+    auto`` may ever turn the *agent's* posture down: the gateway answers every
+    request itself.
+    """
+    for posture in ("auto", "yolo"):
+        harness = make_harness(
+            "--permission",
+            "--permission-command",
+            "make build",
+            approval_posture=posture,
+        )
+        harness.send("/bind alpha")
+        harness.send("/aprobar auto")
+        harness.send("do something")
+        assert harness.wait_idle()
+
+        requests = harness.agent_requests("session/set_config_option")
+        assert requests == [], (
+            f"the gateway must never request a tool_approval posture from the "
+            f"agent (posture={posture}): {requests}"
+        )
+        # The command was still answered by the gateway, without a tap…
+        assert harness.buttons() == []
+        assert harness.permission_responses(), "the agent must still be answered"
+        # …and the fake agent's own posture is untouched: it keeps asking.
+        assert harness.gateway.tiers.posture_for(harness.chat_id) == "auto"
+
+
+def test_aprobar_auto_silences_the_unknown_but_still_taps_always_ask(
+    make_harness: Any, tmp_path: Path
+) -> None:
+    """``/aprobar auto`` widens the *gateway*: unknown silent, always_ask still taps."""
+    # An unknown command stops asking in an auto chat…
+    widened = make_harness(
+        "--permission", "--permission-command", "make build",
+        state_file=tmp_path / "state-auto.json",
+    )
+    widened.send("/bind alpha")
+    widened.send("/aprobar auto")
+    assert "auto" in widened.last_reply()
+    widened.send("build it")
+    assert widened.wait_idle()
+    assert widened.buttons() == [], "an unknown command must be silent at /aprobar auto"
+    assert widened.permission_responses(), "the agent must still be answered"
+
+    # …while always_ask is still a code gate: the tap is required.
+    gated = make_harness(
+        "--permission", "--permission-command", "git push origin main",
+        state_file=tmp_path / "state-gated.json",
+    )
+    gated.send("/bind alpha")
+    gated.send("/aprobar auto")
+    gated.send("ship it")
+    assert gated.wait_for_buttons(), "always_ask must still tap at /aprobar auto"
+    assert gated.permission_responses() == []
+    gated.callback(gated.buttons()[0]["callback_data"])
+    assert gated.wait_idle()
+    assert gated.permission_responses()
+
+    # The default (preguntar) keeps asking for the unknown. Its own state file
+    # keeps it clear of the "auto" binding the earlier harnesses persisted.
+    asking = make_harness(
+        "--permission", "--permission-command", "make build",
+        chat_id=222, state_file=tmp_path / "state-asking.json",
+    )
+    asking.send("/bind alpha")
+    asking.send("build it")
+    assert asking.wait_for_buttons(), "the default posture still asks"
+    asking.callback(asking.buttons()[0]["callback_data"])
+    assert asking.wait_idle()
+
+
+def test_aprobar_persists_in_the_binding_and_shows_in_status(make_harness: Any) -> None:
+    harness = make_harness()
+    harness.send("/aprobar")  # not bound yet
+    assert "/bind" in harness.last_reply()
+
+    harness.send("/bind alpha")
+    harness.send("/aprobar auto")
+    assert "auto" in harness.last_reply()
+    assert harness.gateway.router.get(CHAT).posture == "auto"
+    assert harness.state()["bindings"][str(CHAT)]["approval"] == "auto"
+
+    harness.send("/status")
+    status = harness.last_reply()
+    assert "approval posture: auto" in status
+    assert "agent stays ask" in status
+
+    harness.send("/aprobar preguntar")
+    assert "preguntar" in harness.last_reply()
+    assert harness.gateway.router.get(CHAT).posture == "ask"
+
+    harness.send("/aprobar nonsense")
+    assert "preguntar" in harness.last_reply() and "auto" in harness.last_reply()
+
+
+def test_status_shows_the_effective_gateway_posture(make_harness: Any) -> None:
+    """A widening GATEWAY_APPROVAL_POSTURE shows in /status (the agent still stays ask)."""
     harness = make_harness(approval_posture="auto")
+    harness.send("/bind alpha")
+    harness.send("/status")
+    assert "approval posture: auto" in harness.last_reply()
+    assert "agent stays ask" in harness.last_reply()
+
+    harness.send("/aprobar preguntar")
+    harness.send("/status")
+    assert "approval posture: ask" in harness.last_reply()
+
+
+def test_aprobar_survives_a_gateway_restart(make_harness: Any) -> None:
+    """The posture is persisted in the binding, so a restart keeps it."""
+    first = make_harness("--permission", "--permission-command", "make build")
+    first.send("/bind alpha")
+    first.send("/aprobar auto")
+
+    second = make_harness("--permission", "--permission-command", "make build")
+    second.send("still silent after a restart")
+    assert second.wait_idle()
+    assert second.buttons() == [], "the persisted posture must be applied after a restart"
+    assert second.permission_responses()
+
+
+def test_approval_posture_is_never_a_way_to_stop_the_agent_asking(make_harness: Any) -> None:
+    """A widening config posture must not reach the agent's config options."""
+    harness = make_harness("--permission", approval_posture="auto")
     harness.send("/bind alpha")
     harness.send("hello")
     assert harness.wait_idle()
-
-    requests = harness.agent_requests("session/set_config_option")
-    assert requests, "the gateway should ask for the configured posture"
-    assert requests[0]["params"]["value"] == "auto"
-    assert requests[0]["params"]["configId"] == "tool_approval"
-    assert harness.any_text("✅ done")  # a refusal is logged, not fatal
+    assert harness.agent_requests("session/set_config_option") == []
+    assert harness.any_text("✅ done")  # the turn ran regardless
 
 
 def test_matching_posture_is_not_requested(make_harness: Any) -> None:

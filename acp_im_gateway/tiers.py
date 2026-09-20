@@ -9,8 +9,8 @@ Two lists are evaluated on every ``session/request_permission``:
 * ``auto_allow`` — harmless and read-only commands, approved without a tap so
   the phone is not asked to confirm ``git status`` for the tenth time.
 
-Anything else follows the chat posture (``GATEWAY_APPROVAL_POSTURE``, default
-``ask``).
+Anything else follows the chat posture (``/aprobar`` per chat, defaulting to
+``GATEWAY_APPROVAL_POSTURE`` / ``ask``).
 
 Matching is case-insensitive and inspects the request's ``toolCall.kind``,
 ``toolCall.title``, the ``rawInput`` payload (a shell command string, generic
@@ -24,6 +24,13 @@ tool arguments) and the affected file locations. The two tiers match
   a silent approval, so ``ls`` must not silently bless ``false ls`` or a
   ``results`` search.
 
+A compound line (``a && b | c``) is approved only when **every** segment is
+harmless and read-only: any ``always_ask`` segment forces the tap no matter what
+else is in the line. Interpreter paths are normalised (``./.venv/bin/python -m
+pytest`` == ``python3 -m pytest`` == ``python -m pytest``) and a leading env
+assignment or a harmless prefix (``cd``, ``export``, ``echo``, ``true``,
+``time``, ``nice``) is skipped before the head is matched.
+
 Every decision is logged at INFO with its reason, so the journal explains why
 something was auto-approved or why it was forced to a tap.
 """
@@ -32,11 +39,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Sequence
 
 from .render import curl_creates_data, keyword_match, rm_forced_recursive, shell_commands
-from .render import command_head as _head_matches
 
 if TYPE_CHECKING:  # pragma: no cover - typing only (avoids an import cycle)
     from .approvals import PermissionRequest
@@ -49,6 +57,20 @@ ASK = "ask"
 TIER_ALWAYS_ASK = "always_ask"
 TIER_AUTO_ALLOW = "auto_allow"
 TIER_POSTURE = "posture"
+
+#: Chat postures (``/aprobar``). ``ask`` = tap for anything not in
+#: ``auto_allow``; ``auto`` = silent for anything not in ``always_ask``. ``yolo``
+#: is accepted as a synonym of ``auto`` for backwards compatibility.
+POSTURE_ASK = "ask"
+POSTURE_AUTO = "auto"
+_WIDENING_POSTURES = ("auto", "yolo")
+_POSTURE_NAMES = {
+    "preguntar": POSTURE_ASK,
+    "ask": POSTURE_ASK,
+    "auto": POSTURE_AUTO,
+    "yolo": POSTURE_AUTO,
+    "": POSTURE_ASK,
+}
 
 #: Harmless and read-only. Approve silently, log at INFO.
 DEFAULT_AUTO_ALLOW: tuple[str, ...] = (
@@ -123,6 +145,17 @@ _DESTRUCTIVE_TOKENS = (
 #: Flags that are destructive only for particular commands: ``-d`` deletes a git
 #: branch, but ``ls -d */``, ``git log -d`` and ``grep -d skip`` are read-only.
 _DESTRUCTIVE_BY_SCOPE = {"-d": ("git branch", "git tag")}
+
+#: Leading tokens that are harmless on their own: their arguments are paths or
+#: values, never a command, so ``cd app`` cannot do anything a tap should gate.
+_HARMLESS_PREFIXES = ("cd", "export", "echo", "true")
+#: Prefixes that wrap *another* command and pass its argv through, so the real
+#: head is what follows them: ``time pytest -q``, ``nice -n 5 pytest -q``.
+_WRAPPER_PREFIXES = ("time", "nice")
+#: Bound the prefix chain so a pathological line cannot spin.
+_MAX_PREFIX_DEPTH = 8
+#: ``python``, ``python3``, ``python3.12`` … all name the same interpreter.
+_PYTHON_HEAD = re.compile(r"python(\d+(\.\d+)*)?$")
 
 #: Tool kinds whose *arguments* may be shell commands (so an agent that models a
 #: shell tool as a generic call is still covered by ``auto_allow``).
@@ -313,6 +346,16 @@ def parse_tier_list(raw: Any, *, default: Sequence[str]) -> tuple[str, ...]:
     return tuple(out)
 
 
+def normalize_posture(raw: Any) -> str:
+    """``/aprobar`` value -> ``ask`` | ``auto``.
+
+    ``preguntar``/``ask`` mean "tap for anything not in ``auto_allow``";
+    ``auto``/``yolo`` mean "silent for anything not in ``always_ask``". Anything
+    unrecognised falls back to ``ask``: the cautious direction.
+    """
+    return _POSTURE_NAMES.get(str(raw or "").strip().lower(), POSTURE_ASK)
+
+
 # --------------------------------------------------------------------------- tiers
 
 
@@ -326,6 +369,7 @@ class ApprovalTiers:
         always_ask: Sequence[str] | None = None,
         posture: str = "ask",
         overrides: Mapping[Any, Mapping[str, Any]] | None = None,
+        postures: Mapping[Any, str] | None = None,
         log: logging.Logger | None = None,
     ) -> None:
         self.auto_allow = tuple(auto_allow) if auto_allow is not None else DEFAULT_AUTO_ALLOW
@@ -339,6 +383,11 @@ class ApprovalTiers:
             except (TypeError, ValueError):
                 continue
             self.overrides[key] = _as_rules(rules, self.auto_allow, self.always_ask)
+        #: Per-chat posture (``/aprobar``): ``ask`` | ``auto``. Absent -> the
+        #: global default. Kept in sync with the persisted binding by the gateway.
+        self._postures: dict[int, str] = {}
+        for chat_id, value in (postures or {}).items():
+            self.set_posture(chat_id, value)
 
     # ------------------------------------------------------------------ wiring
 
@@ -362,6 +411,39 @@ class ApprovalTiers:
         if override is not None:
             return override
         return TierRules(auto_allow=self.auto_allow, always_ask=self.always_ask)
+
+    # ------------------------------------------------------------------ posture
+
+    def posture_for(self, chat_id: Any) -> str:
+        """The effective chat posture: the per-chat ``/aprobar`` value or the default."""
+        try:
+            key = int(chat_id)
+        except (TypeError, ValueError):
+            return self.posture
+        return self._postures.get(key, self.posture)
+
+    def set_posture(self, chat_id: Any, posture: str) -> str:
+        """Record a chat's posture (``/aprobar``). Returns the normalised value.
+
+        ``preguntar``/``ask`` -> ``ask``, ``auto``/``yolo`` -> ``auto``. Only the
+        *gateway's* answer changes: the agent's own posture is never touched, so
+        ``always_ask`` still sees every request (see
+        ``Gateway._apply_approval_posture``).
+        """
+        value = normalize_posture(posture)
+        try:
+            key = int(chat_id)
+        except (TypeError, ValueError):
+            return value
+        self._postures[key] = value
+        return value
+
+    def clear_posture(self, chat_id: Any) -> None:
+        try:
+            key = int(chat_id)
+        except (TypeError, ValueError):
+            return
+        self._postures.pop(key, None)
 
     # ------------------------------------------------------------------ deciding
 
@@ -400,15 +482,16 @@ class ApprovalTiers:
                 pattern=allowed,
             )
 
-        if self.posture in ("auto", "yolo"):
+        posture = self.posture_for(chat_id)
+        if posture in _WIDENING_POSTURES:
             return ApprovalDecision(
                 action=AUTO_ALLOW,
-                reason=f"no tier matched; posture {self.posture!r} approves without a tap",
+                reason=f"no tier matched; posture {posture!r} approves without a tap",
                 tier=TIER_POSTURE,
             )
         return ApprovalDecision(
             action=ASK,
-            reason=f"no tier matched; posture {self.posture!r} asks",
+            reason=f"no tier matched; posture {posture!r} asks",
             tier=TIER_POSTURE,
         )
 
@@ -435,15 +518,19 @@ class ApprovalTiers:
         return None
 
     def _auto_allow_hit(self, rules: TierRules, subject: TierSubject) -> str | None:
-        """Every simple command in a candidate must be on the list, and read-only.
+        """Every simple command in a candidate must be harmless and read-only.
 
         ``git status && git diff`` is approved. ``git log | sh``,
-        ``cd app && git status``, ``cat x > /etc/passwd``, ``ls $(rm -rf y)``,
-        ``sudo cat /etc/shadow`` and ``find . -delete`` are not: a whitelist that
-        only looked at the first word of a line would quietly bless the rest of it.
-        A false negative here costs a tap; a false positive silences one.
+        ``cat x > /etc/passwd``, ``ls $(rm -rf y)``, ``sudo cat /etc/shadow`` and
+        ``find . -delete`` are not: a whitelist that only looked at the first word
+        of a line would quietly bless the rest of it. ``cd app && pytest -q`` and
+        ``./.venv/bin/python -m pytest`` *are* approved, because ``cd`` is a
+        harmless prefix and the interpreter path is normalised to ``python``. A
+        false negative here costs a tap; a false positive silences one.
         """
-        patterns: list[tuple[list[str], str]] = [(tokens, pattern) for pattern in rules.auto_allow if (tokens := _tokens(pattern))]
+        patterns: list[tuple[list[str], str]] = [
+            (tokens, pattern) for pattern in rules.auto_allow if (tokens := _tokens(pattern))
+        ]
         if not patterns:
             return None
         candidates = list(subject.commands)
@@ -453,12 +540,7 @@ class ApprovalTiers:
             simples = shell_commands(candidate) or [candidate]
             hits: list[str] = []
             for simple in simples:
-                if not _is_read_only(simple):
-                    hits = []
-                    break
-                hit = next(
-                    (pattern for tokens, pattern in patterns if _head_matches(simple, tokens)), None
-                )
+                hit = _harmless_pattern(simple, patterns)
                 if hit is None:
                     hits = []
                     break
@@ -483,20 +565,21 @@ def _is_read_only(command: str) -> bool:
     """False for anything a whitelist must not silently approve."""
     if any(fragment in command for fragment in _WRITE_FRAGMENTS):
         return False
-    try:
-        import shlex
+    return _tokens_read_only(_split_command(command))
 
-        tokens = shlex.split(command, posix=True)
-    except ValueError:
-        tokens = command.split()
-    scope = _scope(tokens)
+
+def _tokens_read_only(tokens: Sequence[str]) -> bool:
+    """Scope-aware destructive-flag check on one command's argv.
+
+    Run on the *effective* argv too (after ``time``/``nice`` are peeled), so
+    ``time git branch -d main`` cannot hide ``git branch``'s scope rule.
+    """
+    scope = _scope(list(tokens))
     return not any(_is_destructive(token, scope) for token in tokens)
 
 
 def _scope(tokens: list[str]) -> str:
     """``git branch`` for ``git branch -d`` — the command, without env assignments."""
-    import os
-
     real = [
         os.path.basename(token)
         for token in tokens
@@ -524,6 +607,91 @@ def _tokens(pattern: str) -> list[str]:
         return shlex.split(text)
     except ValueError:
         return text.split()
+
+
+def _split_command(command: str) -> list[str]:
+    try:
+        import shlex
+
+        return shlex.split(command, posix=True)
+    except ValueError:
+        return command.split()
+
+
+def _is_env_assignment(token: str) -> bool:
+    """``FOO=1`` is an assignment; ``-x``/``/abs/path`` are not."""
+    return "=" in token and not token.startswith("-") and not token.startswith("/")
+
+
+def _effective_tokens(tokens: list[str]) -> tuple[list[str], str | None]:
+    """Strip leading env assignments and harmless prefixes from one command.
+
+    Returns ``(rest, harmless)``. ``harmless`` is the label of what swallowed the
+    whole segment (``cd app`` -> ``"cd"``, ``FOO=1`` -> ``"FOO"``) when nothing
+    but assignments/prefixes remained; a command wrapper (``time``, ``nice``) is
+    peeled off and the *real* head is returned in ``rest`` so it can be matched.
+    """
+    rest = list(tokens)
+    label: str | None = None
+    for _ in range(_MAX_PREFIX_DEPTH):
+        while rest and _is_env_assignment(rest[0]):
+            label = label or rest[0].split("=", 1)[0]
+            rest.pop(0)
+        if not rest:
+            return [], label or "no-op"
+        head = os.path.basename(rest[0]).lower()
+        if head in _HARMLESS_PREFIXES:
+            return [], head
+        if head not in _WRAPPER_PREFIXES:
+            return rest, None
+        label = head
+        rest.pop(0)
+        if head == "nice":
+            # `nice -n 10` / `nice --adjustment=10` / `nice 10`: options and the
+            # adjustment value, then the real command.
+            while rest and (rest[0].startswith("-") or rest[0].isdigit()):
+                rest.pop(0)
+        else:  # time: flags only, then the real command
+            while rest and rest[0].startswith("-"):
+                rest.pop(0)
+    return rest, None
+
+
+def _normalise_head(tokens: Sequence[str], length: int) -> list[str]:
+    """Lower-case head tokens with the interpreter path normalised.
+
+    ``./.venv/bin/python3.12`` and ``python3`` both become ``python``, so the
+    three spellings of the same pytest run match one ``auto_allow`` entry.
+    """
+    out: list[str] = []
+    for index, token in enumerate(tokens[:length]):
+        text = token.lower()
+        if index == 0:
+            text = os.path.basename(text)
+            if _PYTHON_HEAD.match(text):
+                text = "python"
+        out.append(text)
+    return out
+
+
+def _harmless_pattern(simple: str, patterns: Sequence[tuple[list[str], str]]) -> str | None:
+    """The ``auto_allow`` entry that blesses ``simple``, or None to keep asking.
+
+    Read-only first: a redirect, a substitution or a destructive flag disqualifies
+    the segment whatever its head is.
+    """
+    if not _is_read_only(simple):
+        return None
+    rest, harmless = _effective_tokens(_split_command(simple))
+    if harmless is not None:
+        return harmless
+    # Re-check the peeled argv: a wrapper must not hide a scope-gated flag.
+    if not _tokens_read_only(rest):
+        return None
+    for tokens, pattern in patterns:
+        if _normalise_head(rest, len(tokens)) == _normalise_head(tokens, len(tokens)):
+            return pattern
+    return None
 
 
 def decide_request(

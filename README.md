@@ -66,7 +66,10 @@ that already lives on your machine:
   (Allow / Deny plus whatever options the agent advertised) and answers the ACP
   request with the option you tapped. Harmless read-only commands (`auto_allow`)
   are approved without a tap; money and irreversible commands (`always_ask`) force
-  a tap *even in an `auto`/`yolo` posture*.
+  a tap *whatever the chat posture is*. Each chat picks its posture with
+  `/aprobar` — `preguntar` (default: tap for anything not auto-approved) or `auto`
+  (silent except for `always_ask`). The **agent is always kept in `ask`**: the
+  gateway is the only gatekeeper, so `always_ask` still sees every request.
 * **Sessions that survive a restart.** Bindings and session ids are persisted to a
   JSON state file; on start the gateway re-attaches (`session/load`) or resumes the
   most recent session for that `cwd` (`session/list`) before creating a new one.
@@ -97,10 +100,14 @@ declined cleanly (never left hanging), and stdout lines that are not JSON are
 logged and skipped. The agent process is respawned with exponential backoff if it
 crashes, and in-flight turns fail cleanly instead of hanging.
 
-The default approval posture is `tool_approval = "ask"` (`GATEWAY_APPROVAL_POSTURE`):
-when a session reports a different posture the gateway asks the agent to change it,
-and if the agent does not expose or accept that option the agent's own setting stays
-in charge and the log says so. `/status` shows the model, mode and posture in force.
+The agent's own `tool_approval` posture is pinned to **`ask`** and never loosened.
+The gateway is the only gatekeeper: it answers every `session/request_permission`
+itself (silently for `auto_allow`, with a tap for `always_ask`, and per the chat's
+`/aprobar` posture for everything else). Turning the *agent* down would stop the
+requests arriving, so `always_ask` would never see them and money could be spent
+silently. If the agent does not expose the `tool_approval` option, or refuses the
+call, the log says so and the agent's own setting stays in charge. `/status` shows
+the chat posture and the model/mode in force.
 
 ## Install
 
@@ -245,7 +252,8 @@ frozen it never changes again.
 | `/bind <name> [<path>]` | Binds this chat to a project. `<path>` is optional when the name matches exactly one discovery |
 | `/new` | Starts a fresh session in this chat's project |
 | `/stop` | Cancels the running turn and drops queued messages |
-| `/status` | Bound project, session id, model, mode, approval posture, agent state, queue |
+| `/aprobar preguntar\|auto` | This chat's approval posture. `preguntar` (default): a tap for anything not harmless read-only. `auto`: silent except for `always_ask`. Applied immediately and persisted in the binding; the agent stays in `ask` either way |
+| `/status` | Bound project, session id, model, mode, chat approval posture, agent state, queue |
 | `/unbind` | Forgets this chat's binding |
 | `/help`, `/start` | The command list |
 
@@ -286,13 +294,13 @@ always win over the file. An optional TOML file is read from
 | `GATEWAY_BUSY_MODE` | `steer` | What to do with a message that arrives mid-turn: `steer` or `queue` |
 | `GATEWAY_PAIRING_TTL` | `900` | How long a pairing code stays valid, seconds |
 | `GATEWAY_APPROVAL_TIMEOUT` | `300` | How long an unanswered approval stays pending, seconds |
-| `GATEWAY_APPROVAL_POSTURE` | `ask` | `tool_approval` posture requested from the agent: `ask`, `auto`, `yolo`, or empty to leave the agent's own setting |
+| `GATEWAY_APPROVAL_POSTURE` | `ask` | Default **gateway** chat posture before a chat runs `/aprobar`: `ask` (or `preguntar`) or `auto` (or `yolo`). It never changes the agent's own `tool_approval`, which is pinned to `ask` |
 | `GATEWAY_TOOL_OUTPUT_LINES` | `15` | Lines of a command's output kept under a tool call (the tail, plus a `… (+N more lines)` marker) |
 | `GATEWAY_OVERFLOW_CHARS` | `3500` | When the live transcript passes this, the message is frozen and a new one starts |
 | `GATEWAY_SHOW_THINKING` | `1` | Show the agent's reasoning inside a `<tg-spoiler>`; `0` omits it entirely |
 | `GATEWAY_HEARTBEAT_SECONDS` | `60` | After this long with no visible change, refresh the live message with the elapsed time. `0` disables the pulse |
 | `GATEWAY_AUTO_ALLOW` | read-only commands | Comma-separated whitelist approved **without a tap** (see [Approvals](#approvals)). Empty = turn the tier off |
-| `GATEWAY_ALWAYS_ASK` | money/irreversible | Comma-separated list that **always** requires a tap, even in an `auto`/`yolo` posture. Empty = turn the gate off |
+| `GATEWAY_ALWAYS_ASK` | money/irreversible | Comma-separated list that **always** requires a tap, even at `/aprobar auto`. Empty = turn the gate off |
 | `GATEWAY_DISCOVERY_DEPTH` | `1` | How deep to scan `PROJECTS_ROOT` for `.git` |
 | `GATEWAY_LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `GATEWAY_DRY_RUN` | `0` | Print what would be sent to Telegram instead of calling the API |
@@ -363,25 +371,36 @@ Two lists decide whether a gated tool call needs your thumb:
 | `auto_allow` | harmless and read-only: approved **without a tap**, logged at INFO | `git status`, `git diff`, `git log`, `git show`, `git branch`, `git remote -v`, `ls`, `cat`, `head`, `tail`, `grep`, `rg`, `find`, `pwd`, `wc`, `pytest`, `python -m pytest` |
 | `always_ask` | money or irreversible: a tap is **always** required | `fal.ai`, `fal_client`, `FAL_KEY`, `elevenlabs`, `openai`, `anthropic`, `stripe`, `curl` (only when it creates data), `deploy`, `rsync`, `scp`, `wp`, `rm -rf`, `git push`, `git reset --hard`, `docker push`, `npm publish`, `aws`, `gcloud`, `hetzner`, `cloudpanel` |
 
-Anything else follows the chat posture (`GATEWAY_APPROVAL_POSTURE`, default
-`ask` → a tap).
+Anything else follows the chat posture (`/aprobar`, defaulting to
+`GATEWAY_APPROVAL_POSTURE` = `ask` → a tap). `/aprobar auto` in a chat approves
+everything else silently; `/aprobar preguntar` asks. The **agent** is never turned
+down: it stays in `ask`, so `always_ask` always sees the request.
 
 * **`always_ask` is a code gate, not a posture.** It wins over `auto_allow`, and
-  it forces a tap even when `GATEWAY_APPROVAL_POSTURE` is `auto` or `yolo`:
-  `git status && rm -rf build` asks, and so does `git push` under `yolo`. That is
-  the point — the money protection is not a setting you can be talked out of.
+  it forces a tap even in an `auto` chat: `git status && rm -rf build` asks, and so
+  does `git push` under `/aprobar auto`. That is the point — the money protection
+  is not a setting you can be talked out of.
 * **Matching is case-insensitive and looks at** the request's `toolCall.kind`,
   `toolCall.title`, the `rawInput` payload (a shell command string, generic tool
   arguments) and the affected file locations. The two lists match
   *asymmetrically on purpose*: `always_ask` matches anywhere in that text (a false
   positive costs one tap), while `auto_allow` only matches an affirmative
   **command head**, and only for something that is genuinely read-only:
-  * every command in a compound line must be on the list — `git status && git diff`
-    is approved, `git log | sh` and `cd app && git status` are not;
-  * `ls` does not bless `false ls`, `results` or a `search` query;
-  * a redirection, a command substitution or a destructive flag disqualifies it:
-    `cat x > /etc/passwd`, `ls $(rm -rf y)`, `find . -delete`, `find . -exec rm {} \;`,
-    `git branch -d main` all ask, and `sudo` never inherits a whitelist entry.
+  * every command in a compound line must be harmless — `git status && git diff`,
+    `git log | head -n 5` and `cd app && pytest -q` are approved; `git log | sh`
+    and any line with an unknown segment ask;
+  * interpreter paths are normalised, so `./.venv/bin/python -m pytest`,
+    `python3 -m pytest` and `pytest -q` are the same harmless thing;
+  * a leading env assignment (`FOO=1 pytest -q`) or a harmless prefix (`cd`,
+    `export`, `echo`, `true`, `time`, `nice`) is skipped before the head is
+    matched;
+  * `ls` does not bless `false ls`, `results` or a `search` query; a redirect, a
+    command substitution or a destructive flag disqualifies it
+    (`cat x > /etc/passwd`, `ls $(rm -rf y)`, `find . -delete`,
+    `find . -exec rm {} \;`, `git branch -d main` all ask), and `sudo` never
+    inherits a whitelist entry;
+  * `python -c "…"`, arbitrary scripts and network calls are **not** widened:
+    they keep asking. Only read-only commands are on the list.
   * `curl` gates in every spelling that sends or writes something
     (`-d@file`, `--request=POST`, `-XPOST`, `-T`, `-o`), and `rm -rf` gates its
     equivalents too (`rm -fr`, `rm -r -f`, `rm --recursive --force`).
@@ -459,9 +478,11 @@ Read this before you run it:
   agent was configured with. Treat the chat account as a shell on your machine.
 * The bot token is a password. Keep it in `.env` / the systemd `EnvironmentFile`
   (`chmod 600`), never in git, never in a screenshot, never in a chat.
-* Keep `ALLOWED_USER_IDS` tight, and prefer `tool_approval = "ask"` (the default) so
-  gated tool calls still need a tap. `yolo`-style postures exist in the agent; the
-  gateway will happily relay whatever the agent is configured to do.
+* Keep `ALLOWED_USER_IDS` tight. The gateway pins the agent to
+  `tool_approval = "ask"` and never loosens it, so gated tool calls always come back
+  as a request; what happens then is the chat posture. `/aprobar preguntar` (the
+  default) makes you tap, `/aprobar auto` approves silently except for `always_ask`.
+  Prefer `preguntar` on any chat you share.
 * Prefer a separate, unprivileged user for the gateway, and scope `ALLOWED_ROOTS` to
   the projects you actually want reachable.
 * The gateway itself opens no listening port and never rewrites your prompt, but it
@@ -480,7 +501,8 @@ What this v1 deliberately does **not** do, so you are not surprised:
 * **Approvals are one-shot and chat-wide.** One tap answers one request; there is no
   per-user approval routing, no "remember this forever" beyond whatever the agent
   itself offers as an `allow_always` option, and no way to answer an approval from a
-  different chat. The `auto_allow` list is the only thing approved without a tap.
+  different chat. Only `auto_allow` commands — and, at `/aprobar auto`, everything
+  that is not in `always_ask` — are approved without a tap.
 * **Streaming is coarse.** Edits are coalesced to at most one per
   `GATEWAY_EDIT_INTERVAL` (1.2 s), so a fast turn looks like a burst of updates.
   A silent stretch now shows a heartbeat (`⏳ still working · …`), but there is no
@@ -570,7 +592,7 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/python -m pytest -q
 ```
 
-The suite (258 tests) uses only the standard library plus pytest: an in-memory
+The suite (268 tests) uses only the standard library plus pytest: an in-memory
 Telegram double, a fake clock, and a scriptable fake ACP agent on stdio. It covers
 
 * the containment gate: inside the root, outside it, shared-prefix siblings, `..`
@@ -584,8 +606,14 @@ Telegram double, a fake clock, and a scriptable fake ACP agent on stdio. It cove
   agent output cannot break a message;
 * the approval tiers: every default `auto_allow` and `always_ask` pattern,
   `always_ask` beating `auto_allow`, a bash payload, a generic tool-call payload,
-  an unknown command falling back to the posture, per-chat overrides, and the INFO
+  an unknown command falling back to the posture, per-chat overrides, compound
+  lines (every segment harmless, one dangerous segment taps), normalised
+  interpreter paths (`./.venv/bin/python -m pytest`), env assignments and harmless
+  prefixes, `python -c` still asking, the per-chat `/aprobar` posture, and the INFO
   reason logged for every decision;
+* the v1.2 rule that the **agent stays in `ask`** with the gateway as the only
+  gatekeeper: neither a widening posture nor `/aprobar auto` ever sends the agent a
+  `tool_approval` value, so `always_ask` always sees the request;
 * binding persistence round-trips, corrupt state files, state-file permissions,
   discovery from both sources, and per-chat queueing;
 * the allowlist, group gating, pairing approval/rejection and **pairing expiry**;
@@ -595,7 +623,9 @@ Telegram double, a fake clock, and a scriptable fake ACP agent on stdio. It cove
 * gateway behaviour end to end: denial + pairing codes, `/bind` refusals, a turn
   that reads like the CLI transcript (start, commands with output, tests, finish),
   reasoning quiet by default, forum threads, mid-turn steering vs queueing, `/stop`,
-  `/status`, and approvals reaching the agent (with and without a tap);
+  `/status`, `/aprobar` (silent for the unknown at `auto`, a tap for `always_ask`,
+  persisted across a restart), and approvals reaching the agent (with and without a
+  tap);
 * the CLI: `--help` listing subcommands, config errors, pairing, bindings, dry-run.
 
 One test is marked `integration`. It spawns the **real** agent (`reasonix acp` when it
@@ -619,7 +649,7 @@ acp_im_gateway/
   acp.py          ACP client: stdio JSON-RPC, streaming, respawn, inbound requests
   telegram.py     Bot API client (urllib), chunking, throttling, in-place message stream
   render.py       turn transcript: tool calls, output, spoilers, notices, heartbeat
-  tiers.py        approval tiers: auto_allow (silent) and always_ask (code gate)
+  tiers.py        approval tiers: auto_allow (silent), always_ask (code gate), per-chat posture
   router.py       bindings, project discovery, state persistence, per-chat serialisation
   approvals.py    permission request -> tiers or inline buttons -> ACP response
   gateway.py      the polling/turn loop that ties it all together

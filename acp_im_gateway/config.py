@@ -170,6 +170,9 @@ class Config:
     send_interval: float = 1.0
     poll_timeout: int = 30
     busy_mode: str = "steer"
+    #: Default *gateway* chat posture before a chat runs ``/aprobar`` (``ask`` or
+    #: ``auto``). It never changes the agent's own ``tool_approval`` posture: the
+    #: agent stays in ``ask`` so the ``always_ask`` money gate always sees the call.
     approval_posture: str = "ask"
     pairing_ttl: float = 900.0
     approval_timeout: float = 300.0

@@ -123,7 +123,12 @@ class StateStore:
 
 @dataclass
 class Binding:
-    """A chat's project + session, persisted so restarts can resume."""
+    """A chat's project + session, persisted so restarts can resume.
+
+    ``approval`` holds the chat's **gateway** posture (``/aprobar``: ``ask`` or
+    ``auto``), not the agent's; the agent is pinned to ``ask`` so the money gate
+    always sees the request. ``None`` means the global default.
+    """
 
     chat_id: int
     project_name: str
@@ -137,6 +142,11 @@ class Binding:
 
     def touch(self) -> None:
         self.updated_at = time.time()
+
+    @property
+    def posture(self) -> str:
+        """The chat posture: ``ask`` (default) or ``auto``."""
+        return "auto" if str(self.approval or "").strip().lower() == "auto" else "ask"
 
     def short_session(self, length: int = 8) -> str:
         if not self.session_id:
@@ -550,6 +560,17 @@ class Router:
             binding.approval = approval
         binding.touch()
         self.save()
+        return binding
+
+    def set_approval(self, chat_id: int, posture: str | None) -> Binding | None:
+        """Set the chat's gateway posture (``/aprobar``) and persist it."""
+        binding = self.get(chat_id)
+        if binding is None:
+            return None
+        binding.approval = posture
+        binding.touch()
+        self.save()
+        self.log.info("chat %s approval posture set to %r", chat_id, posture)
         return binding
 
     def list_projects(self, chat_id: int | None = None) -> list[dict[str, Any]]:
