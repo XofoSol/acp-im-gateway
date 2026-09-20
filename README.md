@@ -29,6 +29,7 @@ Two claims are worth stating up front, because they are the whole point:
 - [Install](#install)
 - [Quick start](#quick-start)
 - [Telegram setup](#telegram-setup)
+- [What a turn looks like](#what-a-turn-looks-like)
 - [Commands](#commands)
 - [Configuration](#configuration)
 - [Approvals](#approvals)
@@ -54,10 +55,18 @@ that already lives on your machine:
 * **Streaming in one message.** While a turn runs, the gateway edits a single
   Telegram message in place — never one message per token. Edits are coalesced and
   rate limited (default: at most one edit every 1.2 s).
+* **The chat reads like the CLI.** A turn is a transcript, not one blob: the
+  agent's words as they arrive, every command it ran verbatim with its real
+  output, every file it wrote with its path, its reasoning quietly inside a
+  spoiler, and a ✅/⏹️/❌ verdict with the test summary. When a message would pass
+  ~3500 characters it is frozen and the transcript continues in a new one, so the
+  chat is a sequence of readable blocks.
 * **Approvals from your phone.** When the agent wants to run a gated tool call, the
   gateway turns `session/request_permission` into one message with inline buttons
   (Allow / Deny plus whatever options the agent advertised) and answers the ACP
-  request with the option you tapped.
+  request with the option you tapped. Harmless read-only commands (`auto_allow`)
+  are approved without a tap; money and irreversible commands (`always_ask`) force
+  a tap *even in an `auto`/`yolo` posture*.
 * **Sessions that survive a restart.** Bindings and session ids are persisted to a
   JSON state file; on start the gateway re-attaches (`session/load`) or resumes the
   most recent session for that `cwd` (`session/list`) before creating a new one.
@@ -174,6 +183,60 @@ instead of calling the network (useful to check configuration before going live)
    timeout) plus `sendMessage` / `editMessageText` / `answerCallbackQuery`. Nothing
    listens on a port, so there is no public URL to expose.
 
+## What a turn looks like
+
+One message, edited in place while the agent works, then frozen when it fills up.
+You can follow the whole turn from the chat alone — no extra "what is it doing?"
+message, and no tap unless something needs one:
+
+```text
+⏳ alpha · model gpt-4o
+
+💭 the refund test fails because of a missing import in orders.py
+
+I'll run the suite first.
+
+$ pytest -q [completed]
+… (+18 more lines)
+<pre>tests/test_api.py::test_refund FAILED                                    [ 71%]
+============================== 1 failed, 5 passed in 0.42s ====================</pre>
+
+✏️ src/orders.py [completed]
+<pre>--- src/orders.py
++++ src/orders.py
+-import refunds
++from . import refunds</pre>
+
+✅ done · 4 tool call(s) · 38s · tests: 5 passed, 1 failed
+```
+
+The rules behind those lines:
+
+| Element | How it is rendered |
+| --- | --- |
+| Start | `⏳ <project> · model <model>` — the first line of the transcript |
+| Agent text | verbatim, HTML-escaped, appended as it streams |
+| Shell call | `$ <the exact command> [<status>]`, e.g. `$ pytest -q [completed]` |
+| Other calls | `<icon> <title> [<status>]` (📖 read, ✏️ edit/write, ▶️ execute, 🔎 search) |
+| Tool output | fenced in `<pre>` under the call, last `GATEWAY_TOOL_OUTPUT_LINES` (15) lines, prefixed with `… (+N more lines)` |
+| File writes | `✏️ <path> [<status>]` plus a short unified diff or an excerpt |
+| Reasoning | `💭 <tg-spoiler>…</tg-spoiler>` — collapsed until tapped; omitted entirely with `GATEWAY_SHOW_THINKING=0` |
+| Finish | `✅ done · <n> tool call(s) · <duration> · tests: <summary>` — the summary only when a test command actually ran |
+| Cancelled / error | `⏹️ cancelled` / `❌ <the reason>` |
+| Still-alive | after `GATEWAY_HEARTBEAT_SECONDS` (60) with nothing new: `⏳ still working · 1m 12s elapsed` on the live message |
+
+Telegram's limits are treated as hard rules. Edits are coalesced to at most one
+per `GATEWAY_EDIT_INTERVAL` (1.2 s) per chat, new messages are throttled to one
+per `GATEWAY_SEND_INTERVAL` (1 s), anything over 4096 characters is chunked, and
+the transcript is sent with `parse_mode=HTML` **with the agent's output escaped**
+(and open tags closed and reopened across a split), so nothing the agent prints
+can break a message. Inside a forum topic every reply goes back into the same
+thread (`message_thread_id`).
+
+Because the chat is edited rather than appended to, prefer reading it top-down:
+the newest content is at the bottom of the live message, and once a message is
+frozen it never changes again.
+
 ## Commands
 
 | Command | What it does |
@@ -224,6 +287,12 @@ always win over the file. An optional TOML file is read from
 | `GATEWAY_PAIRING_TTL` | `900` | How long a pairing code stays valid, seconds |
 | `GATEWAY_APPROVAL_TIMEOUT` | `300` | How long an unanswered approval stays pending, seconds |
 | `GATEWAY_APPROVAL_POSTURE` | `ask` | `tool_approval` posture requested from the agent: `ask`, `auto`, `yolo`, or empty to leave the agent's own setting |
+| `GATEWAY_TOOL_OUTPUT_LINES` | `15` | Lines of a command's output kept under a tool call (the tail, plus a `… (+N more lines)` marker) |
+| `GATEWAY_OVERFLOW_CHARS` | `3500` | When the live transcript passes this, the message is frozen and a new one starts |
+| `GATEWAY_SHOW_THINKING` | `1` | Show the agent's reasoning inside a `<tg-spoiler>`; `0` omits it entirely |
+| `GATEWAY_HEARTBEAT_SECONDS` | `60` | After this long with no visible change, refresh the live message with the elapsed time. `0` disables the pulse |
+| `GATEWAY_AUTO_ALLOW` | read-only commands | Comma-separated whitelist approved **without a tap** (see [Approvals](#approvals)). Empty = turn the tier off |
+| `GATEWAY_ALWAYS_ASK` | money/irreversible | Comma-separated list that **always** requires a tap, even in an `auto`/`yolo` posture. Empty = turn the gate off |
 | `GATEWAY_DISCOVERY_DEPTH` | `1` | How deep to scan `PROJECTS_ROOT` for `.git` |
 | `GATEWAY_LOG_LEVEL` | `INFO` | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR` |
 | `GATEWAY_DRY_RUN` | `0` | Print what would be sent to Telegram instead of calling the API |
@@ -256,9 +325,23 @@ busy_mode = "steer"
 pairing_ttl = 900
 approval_timeout = 300
 approval_posture = "ask"
+tool_output_lines = 15
+overflow_chars = 3500
+show_thinking = true
+heartbeat_seconds = 60
 discovery_depth = 1
 log_level = "INFO"
 dry_run = false
+
+# Approval tiers: global defaults, then optional per-chat overrides.
+[approvals]
+auto_allow = ["git status", "git diff", "git log", "ls", "cat", "grep", "rg", "pytest"]
+always_ask = ["stripe", "openai", "rm -rf", "git push", "git reset --hard", "npm publish"]
+
+# A stricter chat: nothing read-only is auto-approved there, and `pytest` needs a tap.
+[approvals.chats."-1001234567890"]
+auto_allow = []
+always_ask = ["pytest"]
 ```
 
 Discovery uses two generic sources and **no hand-written list**:
@@ -273,12 +356,52 @@ Discovery uses two generic sources and **no hand-written list**:
 
 ## Approvals
 
-When the agent asks for permission, the gateway sends one message:
+Two lists decide whether a gated tool call needs your thumb:
+
+| List | Meaning | Defaults |
+| --- | --- | --- |
+| `auto_allow` | harmless and read-only: approved **without a tap**, logged at INFO | `git status`, `git diff`, `git log`, `git show`, `git branch`, `git remote -v`, `ls`, `cat`, `head`, `tail`, `grep`, `rg`, `find`, `pwd`, `wc`, `pytest`, `python -m pytest` |
+| `always_ask` | money or irreversible: a tap is **always** required | `fal.ai`, `fal_client`, `FAL_KEY`, `elevenlabs`, `openai`, `anthropic`, `stripe`, `curl` (only when it creates data), `deploy`, `rsync`, `scp`, `wp`, `rm -rf`, `git push`, `git reset --hard`, `docker push`, `npm publish`, `aws`, `gcloud`, `hetzner`, `cloudpanel` |
+
+Anything else follows the chat posture (`GATEWAY_APPROVAL_POSTURE`, default
+`ask` → a tap).
+
+* **`always_ask` is a code gate, not a posture.** It wins over `auto_allow`, and
+  it forces a tap even when `GATEWAY_APPROVAL_POSTURE` is `auto` or `yolo`:
+  `git status && rm -rf build` asks, and so does `git push` under `yolo`. That is
+  the point — the money protection is not a setting you can be talked out of.
+* **Matching is case-insensitive and looks at** the request's `toolCall.kind`,
+  `toolCall.title`, the `rawInput` payload (a shell command string, generic tool
+  arguments) and the affected file locations. The two lists match
+  *asymmetrically on purpose*: `always_ask` matches anywhere in that text (a false
+  positive costs one tap), while `auto_allow` only matches an affirmative
+  **command head**, and only for something that is genuinely read-only:
+  * every command in a compound line must be on the list — `git status && git diff`
+    is approved, `git log | sh` and `cd app && git status` are not;
+  * `ls` does not bless `false ls`, `results` or a `search` query;
+  * a redirection, a command substitution or a destructive flag disqualifies it:
+    `cat x > /etc/passwd`, `ls $(rm -rf y)`, `find . -delete`, `find . -exec rm {} \;`,
+    `git branch -d main` all ask, and `sudo` never inherits a whitelist entry.
+  * `curl` gates in every spelling that sends or writes something
+    (`-d@file`, `--request=POST`, `-XPOST`, `-T`, `-o`), and `rm -rf` gates its
+    equivalents too (`rm -fr`, `rm -r -f`, `rm --recursive --force`).
+* **Every decision is logged at INFO with its reason**, so the journal explains
+  why something was auto-approved or forced to a tap:
+  ```text
+  INFO acp_im_gateway.tiers: approval tier: Bash (execute) in chat 111 -> auto_allow: 'git status' is read-only
+  INFO acp_im_gateway.approvals: auto-approved Bash in chat 111 as 'allow_once' (auto_allow: 'git status' is read-only)
+  ```
+* Lists are configured globally (`GATEWAY_AUTO_ALLOW` / `GATEWAY_ALWAYS_ASK`, or
+  `[approvals]` in the TOML file) and can be overridden per chat with
+  `[approvals.chats."<chat id>"]`. An empty value turns a tier off — including
+  `GATEWAY_ALWAYS_ASK=`, which disables the money gate, so don't.
+
+When a call is not auto-approved, the gateway sends one message:
 
 ```text
 ▶️ Approval needed — Run the test suite
 kind: execute
-command: pytest -q
+command: npm test
 tool call: call-1
 Tap a button to answer the agent.
 
@@ -295,6 +418,10 @@ Tap a button to answer the agent.
   it into `PermissionRequestResult{Outcome PermissionOutcome}`, whose `outcome` key
   holds an object. A flat `{"outcome":"selected",…}` fails that unmarshaller, the
   reply is rejected and the tool call silently reads as declined.
+* A silent approval always picks a *one-shot* option (`allow_once`) when the agent
+  offers one. If the agent only offers `allow_always`, the command is still
+  approved — it is on your list — but the grant is standing for the session, and
+  the INFO line says which option was used.
 * Callbacks from users who are not allowlisted are refused (`Not authorised.`), and
   a callback from another chat than the one that was asked is refused too.
 * Nothing is left hanging: an unanswered approval expires (`GATEWAY_APPROVAL_TIMEOUT`)
@@ -353,20 +480,28 @@ What this v1 deliberately does **not** do, so you are not surprised:
 * **Approvals are one-shot and chat-wide.** One tap answers one request; there is no
   per-user approval routing, no "remember this forever" beyond whatever the agent
   itself offers as an `allow_always` option, and no way to answer an approval from a
-  different chat.
+  different chat. The `auto_allow` list is the only thing approved without a tap.
 * **Streaming is coarse.** Edits are coalesced to at most one per
-  `GATEWAY_EDIT_INTERVAL` (1.2 s), so a fast turn looks like a burst of updates, and
-  a long silent stretch shows no movement until the next edit. There is no typing
-  indicator per token either.
-* **Messages longer than 4096 characters are chunked** into ordered parts, and code
-  fences left open by a split are closed and reopened in the next part. Telegram is
-  still the rendering authority: the gateway sends plain text (no `parse_mode`),
-  because a broken Markdown message that fails to send is worse than plain text.
+  `GATEWAY_EDIT_INTERVAL` (1.2 s), so a fast turn looks like a burst of updates.
+  A silent stretch now shows a heartbeat (`⏳ still working · …`), but there is no
+  typing indicator per token.
+* **A turn is a transcript, not an append-only log.** The live message is edited
+  in place; once it passes `GATEWAY_OVERFLOW_CHARS` it is frozen and a new one
+  starts, so a very long turn is a *sequence* of messages and the oldest ones stop
+  changing early. Freezing only happens at points that cannot change again (whole
+  blocks, whole lines of an answer), so a tool call is never cut in half.
+* **Messages longer than 4096 characters are chunked** into ordered parts, and
+  open tags or code fences left by a split are closed and reopened in the next
+  part. The turn transcript is sent with `parse_mode=HTML` and the agent's output
+  escaped; command replies and approval prompts stay plain text, because a broken
+  Markdown/HTML message that fails to send is worse than plain text.
 * **One in-flight turn per chat.** A second message steers or queues (configurable);
   it never runs in parallel. `/stop` drops the queue.
 * **Telegram rate limits are respected, not transcended**: at most one new message per
   second per chat (`GATEWAY_SEND_INTERVAL`), and a `429` answer is honoured with its
-  `retry_after` instead of crashing. Very chatty turns therefore arrive a little late.
+  `retry_after` instead of crashing. A busy turn keeps to editing, and past 20
+  messages in a group minute raise `GATEWAY_SEND_INTERVAL` — the gateway prefers
+  editing over posting by design.
 * **Resuming is best-effort.** The gateway re-attaches a bound session with
   `session/load` and otherwise resumes the most recent session for that `cwd`; if the
   agent does not support `loadSession`, a new session is created. A mid-turn agent
@@ -375,8 +510,9 @@ What this v1 deliberately does **not** do, so you are not surprised:
   chat; the gateway does not replay old turns.
 * **No conversation branching, no message editing, no reactions.** Edited Telegram
   messages are ignored.
-* **Groups are basic**: no forum topics (Telegram requires ~100+ members to enable
-  them), no per-thread routing, no multi-chat fan-out for one project.
+* **Groups are basic**: no per-thread routing beyond replying into the forum topic a
+  message came from (`message_thread_id`), no multi-chat fan-out for one project,
+  and no way to create or manage topics.
 * **State file is the source of truth.** Delete it (gateway stopped) to start over.
   A running gateway owns its in-memory bindings; a CLI `bindings remove` for a chat it
   is actively using will be overridden on its next save.
@@ -434,22 +570,32 @@ python -m venv .venv && .venv/bin/pip install -e '.[dev]'
 .venv/bin/python -m pytest -q
 ```
 
-The suite (178 tests) uses only the standard library plus pytest: an in-memory
+The suite (258 tests) uses only the standard library plus pytest: an in-memory
 Telegram double, a fake clock, and a scriptable fake ACP agent on stdio. It covers
 
 * the containment gate: inside the root, outside it, shared-prefix siblings, `..`
   traversal, symlink escapes, a symlinked root, files, missing paths, no roots;
-* chunking at 4096 (including balanced code fences across parts and reassembly),
-  edit coalescing and the per-chat rate limit, and `429`/`retry_after` handling;
+* chunking at 4096 (including balanced code fences *and* balanced HTML tags across
+  parts, and reassembly), edit coalescing, the per-chat rate limit, sealing a full
+  message and continuing in a new one, and `429`/`retry_after` handling;
+* the renderer: tool calls with the exact command and its real output (truncated
+  with a `… (+N more lines)` marker), file edits with a diff, reasoning in a
+  spoiler (and off), the lifecycle notices, the heartbeat, and HTML escaping so
+  agent output cannot break a message;
+* the approval tiers: every default `auto_allow` and `always_ask` pattern,
+  `always_ask` beating `auto_allow`, a bash payload, a generic tool-call payload,
+  an unknown command falling back to the posture, per-chat overrides, and the INFO
+  reason logged for every decision;
 * binding persistence round-trips, corrupt state files, state-file permissions,
   discovery from both sources, and per-chat queueing;
 * the allowlist, group gating, pairing approval/rejection and **pairing expiry**;
 * the ACP client against a fake agent: verbatim prompts, streamed updates, unknown
   notifications, non-JSON stdout, declined inbound requests, deferred permission
   requests, timeouts, crashes + respawn, steering only when advertised;
-* gateway behaviour end to end: denial + pairing codes, `/bind` refusals, one edited
-  message per turn, mid-turn steering vs queueing, `/stop`, `/status`, and approvals
-  reaching the agent;
+* gateway behaviour end to end: denial + pairing codes, `/bind` refusals, a turn
+  that reads like the CLI transcript (start, commands with output, tests, finish),
+  reasoning quiet by default, forum threads, mid-turn steering vs queueing, `/stop`,
+  `/status`, and approvals reaching the agent (with and without a tap);
 * the CLI: `--help` listing subcommands, config errors, pairing, bindings, dry-run.
 
 One test is marked `integration`. It spawns the **real** agent (`reasonix acp` when it
@@ -472,8 +618,10 @@ acp_im_gateway/
   access.py       allowlist, group gate, pairing codes with expiry
   acp.py          ACP client: stdio JSON-RPC, streaming, respawn, inbound requests
   telegram.py     Bot API client (urllib), chunking, throttling, in-place message stream
+  render.py       turn transcript: tool calls, output, spoilers, notices, heartbeat
+  tiers.py        approval tiers: auto_allow (silent) and always_ask (code gate)
   router.py       bindings, project discovery, state persistence, per-chat serialisation
-  approvals.py    permission request -> inline buttons -> ACP response
+  approvals.py    permission request -> tiers or inline buttons -> ACP response
   gateway.py      the polling/turn loop that ties it all together
 tests/            unit tests, a fake ACP agent, and one integration test
 systemd/          service template (no secrets)
@@ -483,7 +631,7 @@ systemd/          service template (no secrets)
 ## Roadmap
 
 * Slack adapter (same router, different transport).
-* Telegram forum topics once a group has enough members to enable them.
+* Richer forum-topic handling (per-topic bindings, topic creation).
 * Opt-in image/audio attachments once agents advertise those prompt capabilities.
 * A small web UI for bindings and approvals.
 
