@@ -187,7 +187,7 @@ def test_safe_table_redacts_the_token(projects_root: Path) -> None:
     assert table["telegram_bot_token"] == "set"
     assert "secret" not in " ".join(table.values())
     assert table["allowed_roots"] == str(projects_root)
-    assert "DMs only" in table["allowed_chat_ids"]
+    assert "self-enable" in table["allowed_chat_ids"]
 
 
 # --------------------------------------------------------------------------- v1.1 knobs

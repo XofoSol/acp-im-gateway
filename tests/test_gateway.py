@@ -52,14 +52,80 @@ def test_unknown_sender_is_denied_and_gets_a_code_in_the_log_only(
     assert harness.agent_requests("session/new") == []
 
 
-def test_group_chats_need_to_be_listed(make_harness: Any) -> None:
-    refused = make_harness(allowed_chats=(), chat_id=-500)
-    refused.send("hello", chat_type="supergroup")
-    assert "ALLOWED_CHAT_IDS" in refused.last_reply()
+def test_allowlisted_user_auto_enables_a_new_group_and_keeps_processing(
+    make_harness: Any,
+) -> None:
+    """A group starts disabled; an allowlisted sender enables it as a side effect."""
+    harness = make_harness(allowed_chats=(), chat_id=-500)
+    assert harness.gateway.access.is_chat_allowed(-500, "supergroup") is False
 
-    allowed = make_harness(allowed_chats=(-500,), chat_id=-500)
-    allowed.send("hello", chat_type="supergroup")
-    assert "/bind" in allowed.last_reply()
+    harness.send("hello", chat_type="supergroup")
+
+    # Enabled in memory and persisted, with a short confirmation in the chat…
+    assert harness.gateway.access.is_chat_allowed(-500, "supergroup") is True
+    assert -500 in harness.state()["access"]["allowed_chat_ids"]
+    assert any("enabled automatically" in text for text in harness.replies())
+    # …and the message was processed, not dropped (unbound -> how to bind).
+    assert "/bind" in harness.last_reply()
+
+    # The very same chat now drives a full turn like any other.
+    harness.send("/bind alpha", chat_type="supergroup")
+    assert "✅ Bound to alpha" in harness.last_reply()
+    harness.send("hi agent", chat_type="supergroup")
+    assert harness.wait_idle()
+    assert [prompt["text"] for prompt in harness.prompts()] == ["hi agent"]
+
+
+def test_a_pre_listed_group_is_used_without_a_confirmation(make_harness: Any) -> None:
+    harness = make_harness(allowed_chats=(-500,), chat_id=-500)
+    harness.send("hello", chat_type="supergroup")
+    assert not any("enabled automatically" in text for text in harness.replies())
+    assert "/bind" in harness.last_reply()
+
+
+def test_unknown_user_in_a_new_group_gets_pairing_and_never_enables_it(
+    make_harness: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.WARNING)
+    harness = make_harness(allowed_chats=(), chat_id=-500)
+
+    harness.send("let me in", chat_type="supergroup", user_id=666)
+
+    assert "Not authorised" in harness.last_reply()
+    match = re.search(r"Code ([A-Z0-9]{8})", caplog.text)
+    assert match, "the pairing code must be written to the gateway log"
+    assert harness.gateway.access.is_user_allowed(666) is False
+    assert harness.gateway.access.is_chat_allowed(-500, "supergroup") is False
+    assert -500 not in harness.state()["access"]["allowed_chat_ids"]
+    assert harness.agent_requests("session/new") == []
+
+
+def test_direct_messages_are_unaffected_by_group_auto_enabling(make_harness: Any) -> None:
+    harness = make_harness(allowed_chats=(), chat_id=CHAT)  # CHAT is a private chat
+    harness.send("hello")  # chat_type defaults to "private"
+
+    assert harness.gateway.access.allowed_chat_ids == set()
+    assert not any("enabled automatically" in text for text in harness.replies())
+    assert "/bind" in harness.last_reply()
+
+    # A DM still runs a normal turn, exactly as before.
+    harness.send("/bind alpha")
+    harness.send("hi agent")
+    assert harness.wait_idle()
+    assert [prompt["text"] for prompt in harness.prompts()] == ["hi agent"]
+
+
+def test_auto_enabled_chat_survives_a_restart(make_harness: Any) -> None:
+    first = make_harness(allowed_chats=(), chat_id=-500)
+    first.send("hello", chat_type="supergroup")
+    assert -500 in first.state()["access"]["allowed_chat_ids"]
+
+    # A fresh gateway on the same state file starts with the chat already enabled.
+    second = make_harness(allowed_chats=(), chat_id=-500)
+    assert second.gateway.access.is_chat_allowed(-500, "supergroup") is True
+    second.send("hello again", chat_type="supergroup")
+    assert not any("enabled automatically" in text for text in second.replies())
+    assert "/bind" in second.last_reply()
 
 
 def test_bind_outside_the_allowed_root_is_refused(make_harness: Any, tmp_path: Path) -> None:

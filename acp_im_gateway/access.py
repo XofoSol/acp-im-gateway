@@ -9,8 +9,10 @@ one-time pairing code for the operator to approve from the CLI:
 Codes expire (:attr:`AccessPolicy.pairing_ttl`), are single-use, and are only
 ever written to the gateway log — never sent to the requester.
 
-Group chats need *both* an allowlisted user and a chat id listed in
-``ALLOWED_CHAT_IDS`` (an empty list means direct messages only).
+Group chats need an allowlisted user and an enabled chat id. ``ALLOWED_CHAT_IDS``
+pre-enables chats; otherwise a group self-enables (via :meth:`AccessPolicy.allow_chat`)
+the first time an allowlisted user speaks in it, and the id is persisted. An unknown
+sender never enables a chat — they only ever get the pairing flow.
 """
 
 from __future__ import annotations
@@ -98,11 +100,29 @@ class AccessPolicy:
         return int(user_id) in self.allowed_user_ids
 
     def is_chat_allowed(self, chat_id: int | None, chat_type: str | None = None) -> bool:
-        """Group traffic needs an explicit ``ALLOWED_CHAT_IDS`` entry; DMs are fine."""
+        """Group traffic needs an enabled chat id; DMs are always fine.
+
+        A chat counts as enabled when it is in ``ALLOWED_CHAT_IDS`` or was
+        auto-enabled (see :meth:`allow_chat`).
+        """
         if chat_type in ("group", "supergroup", "channel"):
             if chat_id is None:
                 return False
             return int(chat_id) in self.allowed_chat_ids
+        return True
+
+    def allow_chat(self, chat_id: int) -> bool:
+        """Enable a group chat by its id. Returns ``True`` when it was new.
+
+        The user allowlist is the real security boundary, so an allowlisted
+        sender naming a group is enough to enable it for good. Callers must have
+        checked :meth:`is_user_allowed` first: an unknown sender never reaches
+        here.
+        """
+        value = int(chat_id)
+        if value in self.allowed_chat_ids:
+            return False
+        self.allowed_chat_ids.add(value)
         return True
 
     def authorize(self, user_id: int | None, chat_id: int | None, chat_type: str | None) -> bool:

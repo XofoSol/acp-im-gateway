@@ -204,7 +204,7 @@ class Config:
             ("telegram_bot_token", token),
             ("telegram_api_base", self.telegram_api_base),
             ("allowed_user_ids", ",".join(str(i) for i in sorted(self.allowed_user_ids)) or "(none)"),
-            ("allowed_chat_ids", ",".join(str(i) for i in sorted(self.allowed_chat_ids)) or "(DMs only)"),
+            ("allowed_chat_ids", ",".join(str(i) for i in sorted(self.allowed_chat_ids)) or "(none — groups self-enable)"),
             ("projects_root", str(self.projects_root)),
             ("allowed_roots", ",".join(str(p) for p in self.resolved_roots())),
             ("agent_index_dir", str(self.agent_index_dir)),

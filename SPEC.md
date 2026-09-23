@@ -108,8 +108,11 @@ Requirements:
 - Pairing for unknown DMs, mirroring the agent's own model: unknown sender gets a short-lived
   one-time code (printed to the gateway log, not sent to the sender) and a CLI
   `python -m acp_im_gateway pairing approve <code>` adds them to the allowlist. Codes expire.
-- Group chats: only allowlisted users may drive the gateway, and only chats listed in
-  `ALLOWED_CHAT_IDS` (empty = DMs only). Document this clearly.
+- Group chats: only allowlisted users may drive the gateway. A chat is enabled by its
+  id: `ALLOWED_CHAT_IDS` pre-enables chats, and a group self-enables (id written to the
+  state file, confirmation sent in the chat) the first time an allowlisted sender speaks
+  in it. An unknown sender never enables a chat — only the allowlisted-sender path does.
+  DMs always work. Document this clearly.
 
 ## Tests and verification (must actually run)
 

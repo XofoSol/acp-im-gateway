@@ -42,6 +42,16 @@ def test_groups_need_an_allowlisted_chat_and_user() -> None:
     assert policy.authorize(901, -500, "group") is False
 
 
+def test_allow_chat_enables_a_group_idempotently() -> None:
+    policy, _ = make_policy(allowed_chat_ids=set())
+    assert policy.is_chat_allowed(-500, "supergroup") is False
+    assert policy.allow_chat(-500) is True  # newly enabled
+    assert policy.is_chat_allowed(-500, "supergroup") is True
+    assert policy.allow_chat(-500) is False  # already enabled, no-op
+    assert policy.allow_chat("-500") is False  # coerced to int
+    assert policy.to_dict()["allowed_chat_ids"] == [-500]
+
+
 def test_pairing_code_flow() -> None:
     policy, _ = make_policy(allowed_user_ids={900}, code_factory=lambda: "CODE1234")
     assert policy.request_pairing(900, 111) is None  # already allowed

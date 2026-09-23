@@ -67,7 +67,8 @@ Approval postures (per chat)
   The agent always stays in `ask`: the gateway is the only gatekeeper, so the
   money gate always sees the request.
 
-Direct messages only by default: group chats must be listed in ALLOWED_CHAT_IDS.
+Direct messages work out of the box. A group chat is enabled by its id
+(ALLOWED_CHAT_IDS) or the first time an allowlisted sender speaks in it.
 """
 
 #: The agent's own ``tool_approval`` posture is pinned here, forever. Loosening it
@@ -235,11 +236,10 @@ class Gateway:
             self._offer_pairing(user_id, chat_id, user, chat_type)
             return
         if not self.access.is_chat_allowed(chat_id, chat_type):
-            self._reply(
-                chat_id,
-                "This group chat is not enabled. Add its id to ALLOWED_CHAT_IDS and restart the gateway.",
-            )
-            return
+            # A group that is not enabled yet, reached by an allowlisted sender
+            # (unknown users already returned above). Enable it for good, then
+            # carry on: the message is answered, never dropped.
+            self._auto_authorize_chat(chat_id, chat_type)
 
         text = message.get("text")
         if not text:
@@ -883,6 +883,25 @@ class Gateway:
         return None
 
     # ------------------------------------------------------------------ access
+
+    def _auto_authorize_chat(self, chat_id: int, chat_type: str) -> None:
+        """Enable a group chat the first time an allowlisted user speaks in it.
+
+        The user allowlist is the real security boundary and ``handle_message``
+        only reaches here once the sender passed it, so an allowlisted user
+        naming a new group is enough to enable it. The id is persisted at once
+        (atomic, like every other state write) so a restart remembers it, and a
+        short confirmation goes back to the chat. Unknown senders never get here.
+        """
+        if not self.access.allow_chat(chat_id):
+            return
+        self.router.save()
+        self.log.info("chat %s (%s) auto-authorised by an allowlisted user", chat_id, chat_type)
+        self._reply(
+            chat_id,
+            "✅ This group chat was enabled automatically and is now remembered, "
+            "so it stays enabled after a restart.",
+        )
 
     def _offer_pairing(
         self, user_id: Any, chat_id: int, user: Mapping[str, Any], chat_type: str

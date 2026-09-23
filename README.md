@@ -180,10 +180,12 @@ instead of calling the network (useful to check configuration before going live)
    (or read the `from.id` in your updates) and put it in `ALLOWED_USER_IDS`. You can
    also leave it empty and pair yourself through the CLI flow above — the gateway
    denies everything by default, including you.
-3. **Direct messages** need nothing else. **Groups** need two things:
-   * `ALLOWED_CHAT_IDS` must list the group id (an empty list means *direct messages
-     only*), and
-   * the sender must still be allowlisted.
+3. **Direct messages** need nothing else. **Groups** enable themselves: the first
+   time an allowlisted sender talks in a group, the gateway adds that chat to the
+   allowlist, confirms it in the chat, and remembers it across restarts — no
+   `ALLOWED_CHAT_IDS` edit and no restart. Pre-seed `ALLOWED_CHAT_IDS` only to enable
+   a group *before* anyone speaks in it (empty = nothing pre-enabled; direct messages
+   always work). An unknown sender never enables a chat: they get the pairing flow.
    In groups, disable privacy mode for the bot with `@BotFather → /setprivacy → your
    bot → Disable`, otherwise the bot only sees commands addressed to it.
 4. **No webhook, ever.** The gateway only calls `getUpdates` (long polling, 30 s
@@ -278,7 +280,7 @@ always win over the file. An optional TOML file is read from
 | `TELEGRAM_BOT_TOKEN` | *(empty)* | Bot token from @BotFather. Required to `run` |
 | `TELEGRAM_API_BASE` | `https://api.telegram.org` | Bot API base URL (override for a local Bot API server) |
 | `ALLOWED_USER_IDS` | *(empty)* | Comma-separated Telegram user ids that may drive the gateway. Empty = nobody (deny by default) |
-| `ALLOWED_CHAT_IDS` | *(empty)* | Comma-separated chat ids allowed in **groups**. Empty = direct messages only |
+| `ALLOWED_CHAT_IDS` | *(empty)* | Comma-separated chat ids to pre-enable for **groups**. A group also self-enables the first time an allowlisted user speaks in it (persisted in the state file). Empty = nothing pre-enabled; direct messages always work |
 | `PROJECTS_ROOT` | `~/Projects` | Root scanned for project candidates (directories containing `.git`) |
 | `ALLOWED_ROOTS` | *(empty = `PROJECTS_ROOT`)* | Comma-separated roots a chat may bind a directory inside |
 | `REASONIX_PROJECTS_DIR` | `~/.reasonix/projects` | The agent's own project index, used as discovery hints. Absent = fine |
@@ -459,8 +461,11 @@ Both are **code gates**, not conventions:
   with `python -m acp_im_gateway pairing approve <code>`. Codes expire
   (`GATEWAY_PAIRING_TTL`) and a refused code cannot be resurrected by a stale copy of
   the state file.
-* **Groups.** A group chat needs its id in `ALLOWED_CHAT_IDS` *and* an allowlisted
-  sender. Empty `ALLOWED_CHAT_IDS` means direct messages only.
+* **Groups.** Only allowlisted senders may drive the gateway, and a group chat is
+  enabled by its id. A chat listed in `ALLOWED_CHAT_IDS` starts enabled; otherwise the
+  first message from an allowlisted sender enables it automatically (the id is written
+  to the state file, so it survives a restart) and a short confirmation goes back to
+  the chat. An unknown sender never enables a chat — they get the pairing flow instead.
 * **Containment.** A chat may only bind a directory inside `ALLOWED_ROOTS`
   (default: `PROJECTS_ROOT`). The path is expanded, resolved with
   `os.path.realpath` (so `..` and symlinks collapse to their real location) and
