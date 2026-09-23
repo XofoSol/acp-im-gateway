@@ -8,20 +8,26 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from acp_im_gateway.acp import STEER_METHOD
-from acp_im_gateway.gateway import TurnView
+from acp_im_gateway.gateway import MAX_DELIVERY_FAILURES, TurnView
+from acp_im_gateway.telegram import TelegramError
 
 from .helpers import (
     CHAT,
+    PARSE_400_DESCRIPTION,
     events_named,
     make_harness,  # noqa: F401  (pytest fixture: used by name in the signatures)
     wait_until,
 )
+
+#: Telegram's permanent 400 for unparsable markup, as the streaming path sees it.
+PARSE_400 = TelegramError(f"editMessageText failed: {PARSE_400_DESCRIPTION}", status=400)
 
 # --------------------------------------------------------------------------- access
 
@@ -595,3 +601,79 @@ def test_turns_after_the_first_one_start_immediately(make_harness: Any) -> None:
     assert harness.runtime.queue_size == 0
     assert "Dropped" not in harness.last_reply()
     assert [prompt["text"] for prompt in harness.prompts()] == ["first", "second"]
+
+
+# --------------------------------------------------------------------------- delivery failures
+
+
+def test_a_permanently_rejected_body_stops_retrying_and_unblocks_the_chat(
+    make_harness: Any,
+) -> None:
+    """Regression for the hang: a body Telegram rejects *for good* must not be
+    retried on every poll forever. The turn has to complete so the chat unlocks
+    and the queue drains."""
+    harness = make_harness("--slow", "2.0", heartbeat_seconds=0.05, edit_interval=0.0)
+    harness.send("/bind alpha")
+    harness.send("first")
+    assert harness.wait_idle()
+
+    harness.telegram.reset()
+    harness.telegram.fail_edit = PARSE_400  # every edit is refused, permanently
+
+    harness.send("second")
+    harness.send("third")  # queued behind the running turn
+    assert harness.runtime.queue_size == 1
+
+    # The gateway gives up and says so, in plain text, instead of looping.
+    assert wait_until(
+        lambda: any("stopped retrying" in text for text in harness.replies()), timeout=10
+    )
+
+    settled = harness.telegram.edit_attempts
+    time.sleep(0.6)
+    assert harness.telegram.edit_attempts == settled, "retrying must stay bounded"
+    # Each of the MAX_DELIVERY_FAILURES pushes makes at most an HTML + a plain try.
+    assert settled <= MAX_DELIVERY_FAILURES * 2
+
+    # …and the chat is not left blocked: both turns run and the queue drains.
+    assert harness.wait_idle(timeout=15)
+    assert harness.runtime.busy is False
+    assert harness.runtime.queue_size == 0
+    assert [prompt["text"] for prompt in harness.prompts()] == ["first", "second", "third"]
+
+
+def test_stop_takes_effect_while_delivery_is_failing(make_harness: Any) -> None:
+    harness = make_harness("--permission", heartbeat_seconds=0.05, edit_interval=0.0)
+    harness.send("/bind alpha")
+    harness.send("long turn")
+    assert harness.wait_for_buttons()
+
+    harness.telegram.fail_edit = PARSE_400  # streaming edits now fail
+
+    harness.send("/stop")
+    assert harness.wait_idle(timeout=10)
+    assert harness.runtime.busy is False
+    assert events_named(harness.agent_events(), "cancel"), "the agent must be told to cancel"
+    assert any("Cancelling" in text for text in harness.replies())
+
+
+def test_a_turn_refused_for_its_markup_is_still_delivered_as_plain_text(
+    make_harness: Any,
+) -> None:
+    """A/4 end to end: when Telegram refuses the HTML, the turn's content still
+    reaches the chat (unformatted) and the turn completes normally."""
+    harness = make_harness(
+        "--tool-command", "pytest -q", "--tool-output", "1 passed in 0.10s"
+    )
+    harness.send("/bind alpha")
+    harness.telegram.reset()
+    harness.telegram.reject_html = True  # every HTML call is refused
+
+    harness.send("run the tests")
+    assert harness.wait_idle()
+
+    assert harness.runtime.busy is False
+    chat = harness.current_text()
+    assert "$ pytest -q [completed]" in chat  # tags stripped, content kept
+    assert "<pre>" not in chat
+    assert "1 passed in 0.10s" in chat

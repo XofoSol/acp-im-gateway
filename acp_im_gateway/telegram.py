@@ -9,6 +9,10 @@ Design notes that matter for correctness:
   (default 1.2s) between edits. Never one message per token.
 * **Chunking** — anything over 4096 characters is split into ordered parts, and
   code fences left open by a split are closed and reopened so every part renders.
+* **Balanced HTML or nothing** — a part whose gateway tags are not strictly
+  balanced is sent as plain text rather than refused; if Telegram still rejects a
+  body for its markup, it is retried once with the tags stripped. A message is
+  never lost because of formatting.
 * **Plain text** — no ``parse_mode``: a broken Markdown message that fails to send
   is worse than plain text.
 * **Rate limits** — at most one new message per second per chat, and ``429``
@@ -17,6 +21,7 @@ Design notes that matter for correctness:
 
 from __future__ import annotations
 
+import html
 import json
 import logging
 import re
@@ -47,6 +52,34 @@ class TelegramTransportError(TelegramError):
     """Network-level failure (DNS, timeout, connection reset)."""
 
 
+#: Descriptions Telegram uses when its HTML/Markdown parser refuses a body. A
+#: ``400`` with one of these is permanent for *that* text: retrying the identical
+#: body can never succeed, so the caller must drop the markup and send plain text.
+_PARSE_ERROR_MARKERS = (
+    "can't parse",
+    "cannot parse",
+    "parse entities",
+    "unexpected end tag",
+    "unexpected start tag",
+    "can't find end tag",
+    "cannot find end tag",
+    "unsupported start tag",
+    "unsupported end tag",
+    "unsupported entity",
+)
+
+
+def is_parse_error(error: BaseException) -> bool:
+    """True when Telegram rejected a message because its markup would not parse.
+
+    These rejections are permanent for the body that triggered them: a parse
+    error is not something a later retry of the same text can fix. Callers use
+    this to fall back to plain text exactly once instead of hammering Telegram.
+    """
+    text = str(error).lower()
+    return any(marker in text for marker in _PARSE_ERROR_MARKERS)
+
+
 # --------------------------------------------------------------------------- chunking
 
 _FENCE_LINE = re.compile(r"^\s*```(.*)$")
@@ -61,6 +94,45 @@ _HTML_TAG = re.compile(
 )
 #: Room kept for the tags that close at the end of a part.
 _HTML_TAG_RESERVE = 64
+
+#: Matches only the tags the gateway itself emits. Agent text is escaped before it
+#: reaches here, so a literal ``&lt;/b&gt;`` is not a tag and survives a strip.
+_GATEWAY_TAG = re.compile(
+    r"</?(?:" + "|".join(re.escape(tag) for tag in HTML_TAGS) + r")(?:\s[^>]*)?>",
+    re.IGNORECASE,
+)
+
+
+def strip_markup(text: str) -> str:
+    """Turn a gateway-rendered HTML body into readable plain text.
+
+    The gateway's own tags are removed and the entities it escaped are unescaped,
+    so a message Telegram refuses for its markup is still delivered unformatted
+    rather than lost. Stripping runs before unescaping: that way an agent's
+    escaped ``&lt;/b&gt;`` becomes a plain ``</b>`` in the text instead of being
+    mistaken for a tag and dropped.
+    """
+    return html.unescape(_GATEWAY_TAG.sub("", text))
+
+
+def html_balanced(text: str) -> bool:
+    """True when every gateway tag in ``text`` is strictly nested.
+
+    :func:`scan_html` tolerates sloppy input — it drops a stray or out-of-order
+    close instead of failing — which is fine when *choosing a cut*, but Telegram
+    is stricter: a body that is not strictly balanced must never go out with
+    ``parse_mode="HTML"``, or it is rejected outright.
+    """
+    stack: list[str] = []
+    for match in _HTML_TAG.finditer(text):
+        tag = match.group("tag").lower()
+        if match.group(0).startswith("</"):
+            if not stack or stack[-1] != tag:
+                return False
+            stack.pop()
+        else:
+            stack.append(tag)
+    return not stack
 
 
 def scan_fences(text: str, state: str | None = None) -> str | None:
@@ -470,10 +542,41 @@ class TelegramClient:
                 params["reply_markup"] = dict(reply_markup)
             if reply_to_message_id is not None and index == 0:
                 params["reply_to_message_id"] = int(reply_to_message_id)
-            result = self.call("sendMessage", params, respect_rate_limit=True)
+            result = self._call_with_plain_fallback("sendMessage", params, parse_mode)
             if isinstance(result, Mapping):
                 sent.append(dict(result))
         return sent
+
+    def _call_with_plain_fallback(
+        self,
+        method: str,
+        params: Mapping[str, Any],
+        parse_mode: str | None,
+        *,
+        respect_rate_limit: bool = True,
+    ) -> Any:
+        """Call ``method``; on a markup rejection, retry once with plain text.
+
+        A parse rejection is permanent for the body that triggered it, so the
+        only way the message survives is to drop the markup. This keeps the
+        promise that a message is never lost because of formatting.
+        """
+        try:
+            return self.call(method, params, respect_rate_limit=respect_rate_limit)
+        except TelegramError as exc:
+            if parse_mode is None or not is_parse_error(exc):
+                raise
+            self.log.warning(
+                "%s was refused for chat %s (%s); retrying as plain text",
+                method,
+                params.get("chat_id"),
+                exc,
+            )
+            plain_params = dict(params)
+            plain_params.pop("parse_mode", None)
+            if isinstance(plain_params.get("text"), str):
+                plain_params["text"] = strip_markup(plain_params["text"])
+            return self.call(method, plain_params, respect_rate_limit=respect_rate_limit)
 
     def edit_message_text(
         self,
@@ -495,7 +598,9 @@ class TelegramClient:
         if reply_markup is not None:
             params["reply_markup"] = dict(reply_markup)
         try:
-            result = self.call("editMessageText", params)
+            result = self._call_with_plain_fallback(
+                "editMessageText", params, parse_mode, respect_rate_limit=False
+            )
         except TelegramError as exc:
             # "message is not modified" is a benign race with our own coalescing.
             if "not modified" in str(exc).lower():
@@ -621,6 +726,12 @@ class MessageStream:
     _last_flush: float = 0.0
     _closed: bool = False
 
+    def __post_init__(self) -> None:
+        # Tests pass an explicit ``log=None``; a delivery warning must never crash
+        # the very path it is trying to report on.
+        if self.log is None:
+            self.log = _logger
+
     @property
     def text(self) -> str:
         return self._text
@@ -698,23 +809,12 @@ class MessageStream:
                 message = self._messages[position]
                 if message.text == part:
                     continue
-                self.client.edit_message_text(
-                    message.chat_id,
-                    message.message_id,
-                    part,
-                    parse_mode=self.parse_mode,
-                )
+                self._deliver_edit(message.chat_id, message.message_id, part)
                 message.text = part
                 changed = True
             else:
                 markup = self.reply_markup if index == 0 else None
-                sent = self.client.send_message(
-                    self.chat_id,
-                    part,
-                    reply_markup=markup,
-                    parse_mode=self.parse_mode,
-                    message_thread_id=self.thread_id,
-                )
+                sent = self._deliver_send(part, markup)
                 if not sent:  # pragma: no cover - dry-run/network failure path
                     break
                 result = sent[0]
@@ -729,6 +829,70 @@ class MessageStream:
         self._sent_text = self._text
         self._last_flush = self.clock()
         return changed
+
+    # ------------------------------------------------------------------ delivery
+
+    def _for_delivery(self, part: str) -> tuple[str, str | None]:
+        """Pick ``(text, parse_mode)`` for one part.
+
+        The gateway claims its own chunking keeps the tags balanced, so an
+        *unbalanced* part means something slipped through (a cut inside a block,
+        a broken chunk). Telegram would reject it outright, so it is downgraded
+        to plain text here instead of being refused on the wire.
+        """
+        if self.parse_mode == "HTML" and not html_balanced(part):
+            self.log.warning(
+                "unbalanced HTML for chat %s; sending this part as plain text",
+                self.chat_id,
+            )
+            return strip_markup(part), None
+        return part, self.parse_mode
+
+    def _deliver_edit(self, chat_id: int, message_id: int, part: str) -> None:
+        """Edit one message, retrying once as plain text if Telegram refuses it."""
+        text, parse_mode = self._for_delivery(part)
+        try:
+            self.client.edit_message_text(
+                chat_id, message_id, text, parse_mode=parse_mode
+            )
+        except TelegramError as exc:
+            if parse_mode is None or not is_parse_error(exc):
+                raise
+            self.log.warning(
+                "editMessageText refused the markup for chat %s (%s); retrying as plain text",
+                chat_id,
+                exc,
+            )
+            self.client.edit_message_text(
+                chat_id, message_id, strip_markup(text), parse_mode=None
+            )
+
+    def _deliver_send(self, part: str, markup: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+        """Send one part, retrying once as plain text if Telegram refuses it."""
+        text, parse_mode = self._for_delivery(part)
+        try:
+            return self.client.send_message(
+                self.chat_id,
+                text,
+                reply_markup=markup,
+                parse_mode=parse_mode,
+                message_thread_id=self.thread_id,
+            )
+        except TelegramError as exc:
+            if parse_mode is None or not is_parse_error(exc):
+                raise
+            self.log.warning(
+                "sendMessage refused the markup for chat %s (%s); retrying as plain text",
+                self.chat_id,
+                exc,
+            )
+            return self.client.send_message(
+                self.chat_id,
+                strip_markup(text),
+                reply_markup=markup,
+                parse_mode=None,
+                message_thread_id=self.thread_id,
+            )
 
     def close(self, final_text: str | None = None) -> bool:
         """Flush the final text unconditionally and stop accepting updates."""

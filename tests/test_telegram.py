@@ -15,12 +15,15 @@ from acp_im_gateway.telegram import (
     TelegramTransportError,
     Throttle,
     chunk_message,
+    html_balanced,
     inline_keyboard,
+    is_parse_error,
     reassemble,
     scan_fences,
+    strip_markup,
 )
 
-from .helpers import FakeClock, FakeTelegram
+from .helpers import PARSE_400_DESCRIPTION, FakeClock, FakeTelegram
 
 
 # --------------------------------------------------------------------------- chunking
@@ -433,3 +436,97 @@ def test_stream_seal_can_freeze_a_prefix_of_what_was_pushed() -> None:
     assert current[sent[0].message_id] == frozen
     assert current[sent[1].message_id] == "\n\nbody starts here\n\nand more", "no duplication"
     assert (current[sent[0].message_id] + current[sent[1].message_id]) == full + "\n\nand more"
+
+
+# --------------------------------------------------------------------------- markup fallback
+
+
+def test_is_parse_error_recognises_a_markup_rejection() -> None:
+    assert is_parse_error(
+        TelegramError(f"sendMessage failed: {PARSE_400_DESCRIPTION}", status=400)
+    )
+    assert is_parse_error(
+        TelegramError("editMessageText failed: can't find end tag", status=400)
+    )
+    # A generic 400 (or any other failure) is not a markup problem.
+    assert not is_parse_error(TelegramError("chat not found", status=400))
+    assert not is_parse_error(TelegramError("Too Many Requests", status=429))
+
+
+def test_strip_markup_removes_gateway_tags_and_decodes_entities() -> None:
+    body = "<pre>$ ls &amp;&amp; echo '&lt;b&gt;'</pre>"
+    assert strip_markup(body) == "$ ls && echo '<b>'"
+    # A literal ``&lt;/b&gt;`` is *text*, not a tag: stripping leaves it alone.
+    assert strip_markup("<tg-spoiler>a &lt;/b&gt; b</tg-spoiler>") == "a </b> b"
+
+
+def test_html_balanced_flags_stray_and_unclosed_tags() -> None:
+    assert html_balanced("<b>x</b>")
+    assert html_balanced("<tg-spoiler><pre>code</pre></tg-spoiler>")
+    assert html_balanced("no tags at all")
+    assert not html_balanced("<pre>unclosed")
+    assert not html_balanced("stray </b>")
+    assert not html_balanced("<b><i>x</b></i>")
+
+
+def test_chunking_alone_cannot_repair_a_stray_closing_tag() -> None:
+    """Why :func:`html_balanced` exists: chunking balances *its own* cuts but
+    hands a short, already-broken body straight through."""
+    body = "hello </b> world"
+    assert chunk_message(body, html=True) == [body]
+    assert not html_balanced(body)
+
+
+def test_message_stream_replays_a_parse_rejection_as_plain_text() -> None:
+    """A: a body Telegram refuses for its markup is re-sent unformatted."""
+    telegram = FakeTelegram()
+    telegram.reject_html = True  # every HTML call is refused, plain text is not
+    stream = make_stream(telegram, FakeClock(), parse_mode="HTML")
+    assert stream.push("<pre>hola &amp; adiós</pre>") is True
+
+    assert telegram.current_text(111) == "hola & adiós"  # content survives, unformatted
+    # The HTML attempt was refused (only successful calls are recorded), then the
+    # plain re-send landed with the markup dropped.
+    assert telegram.send_attempts == 2
+    sent = telegram.calls_named("sendMessage")
+    assert sent[-1]["parse_mode"] is None
+    assert stream.live_message_id is not None
+
+
+def test_message_stream_replays_a_parse_rejection_on_edit_as_plain_text() -> None:
+    telegram = FakeTelegram()
+    clock = FakeClock()
+    stream = make_stream(telegram, clock, parse_mode="HTML", edit_interval=0.0)
+    stream.push("<pre>first</pre>")
+    assert telegram.current_text(111) == "<pre>first</pre>"
+
+    telegram.reject_html = True  # markup starts being refused
+    clock.advance(5.0)
+    assert stream.push("<pre>first and second</pre>") is True
+    assert telegram.current_text(111) == "first and second"
+    assert telegram.edit_attempts == 2  # HTML edit refused, then the plain re-edit
+    assert telegram.calls_named("editMessageText")[-1]["parse_mode"] is None
+
+
+def test_message_stream_delivers_an_unbalanced_body_as_plain_text() -> None:
+    """C/4: a body the balancer cannot make valid is never sent as HTML."""
+    telegram = FakeTelegram()
+    stream = make_stream(telegram, FakeClock(), parse_mode="HTML")
+    assert stream.push("before <pre>oops") is True
+    assert telegram.calls_named("sendMessage")[-1]["parse_mode"] is None
+    assert telegram.current_text(111) == "before oops"
+
+
+def test_client_retries_a_markup_rejection_as_plain_text() -> None:
+    """A: the same fallback protects the direct (non-streaming) send path."""
+    client = ScriptedClient(
+        [
+            {"ok": False, "error_code": 400, "description": PARSE_400_DESCRIPTION},
+            {"ok": True, "result": {"message_id": 9}},
+        ]
+    )
+    sent = client.send_message(1, "<b>hi</b>", parse_mode="HTML")
+    assert sent == [{"message_id": 9}]
+    assert client.payloads[0]["parse_mode"] == "HTML"
+    assert "parse_mode" not in client.payloads[1]  # plain text: markup dropped
+    assert client.payloads[1]["text"] == "hi"

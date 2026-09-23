@@ -299,3 +299,69 @@ def test_streaming_text_stays_a_single_growing_block() -> None:
     say(view, "hello ")
     say(view, "world")
     assert view.blocks() == ["hello world"]
+
+
+# --------------------------------------------------------------------------- markup safety
+
+
+def test_agent_output_with_a_stray_closing_tag_is_escaped() -> None:
+    """C: agent text can never smuggle a real tag into an HTML message."""
+    from acp_im_gateway.telegram import html_balanced
+
+    view = TurnView()
+    view.start("alpha", "m")
+    say(view, "close it: </b> and </code> and even <pre>")
+    body = view.render()
+    assert "</b>" not in body and "</code>" not in body and "<pre>" not in body
+    assert "&lt;/b&gt;" in body and "&lt;/code&gt;" in body
+    assert html_balanced(body)
+
+
+def test_tool_status_is_escaped_like_every_other_agent_field() -> None:
+    from acp_im_gateway.telegram import html_balanced
+
+    view = TurnView()
+    view.start("alpha", "m")
+    tool(view, toolCallId="c1", title="Bash", kind="execute", status="</b>")
+    body = view.render()
+    assert "[</b>]" not in body
+    assert "[&lt;/b&gt;]" in body
+    assert html_balanced(body)
+
+
+def test_freeze_point_never_cuts_inside_a_block() -> None:
+    """C: freezing mid-block used to split a ``<pre>`` and send unbalanced HTML."""
+    from acp_im_gateway.telegram import html_balanced, scan_html
+
+    view = TurnView()
+    view.start("alpha", "m")
+    tool(view, toolCallId="c1", title="Bash", kind="execute", status="in_progress",
+         rawInput={"command": "cat big.txt"})
+    tool_update(
+        view,
+        "c1",
+        status="completed",
+        content=[
+            {
+                "type": "content",
+                "content": {"type": "text", "text": "\n".join(f"line {i} " + "x" * 40 for i in range(200))},
+            }
+        ],
+    )
+    body = view.render()
+    cut = view.freeze_point()
+    assert 0 < cut < len(body)
+    assert scan_html(body[:cut]) == ()
+    assert html_balanced(body[:cut])
+    # …and the remainder that starts the next message is balanced too.
+    assert html_balanced(body[cut:])
+
+
+def test_freeze_point_still_cuts_on_a_line_inside_the_agent_buffer() -> None:
+    """The line-level cut is kept for the append-only text run."""
+    view = TurnView()
+    view.start("alpha", "m")
+    say(view, "first line\nsecond line")
+    cut = view.freeze_point()
+    # The start notice is a whole block; the buffer is cut at its newline.
+    assert view.render()[:cut] == "⏳ alpha · model m\n\nfirst line"

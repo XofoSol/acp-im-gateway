@@ -76,6 +76,14 @@ Direct messages work out of the box. A group chat is enabled by its id
 #: them and money could be spent silently. Only the gateway answers requests.
 AGENT_POSTURE = "ask"
 
+#: Consecutive delivery failures a single turn tolerates before it stops trying to
+#: reach Telegram. A body Telegram rejects for good — a parse error that survived
+#: the plain-text fallback, a chat that is gone — would otherwise be retried on
+#: every poll forever: the log fills, the network is hammered, and the chat looks
+#: hung behind a turn that never ends. After this many failures the turn gives up
+#: on delivery but keeps running, so the queue drains and /stop keeps working.
+MAX_DELIVERY_FAILURES = 3
+
 class Gateway:
     """Long-polling Telegram gateway around one ACP agent process."""
 
@@ -692,7 +700,8 @@ class Gateway:
             # The finish notice closes the last block: refresh once more so a full
             # live message is frozen and the verdict opens a new one.
             turn.refresh()
-            self._stream_close(stream, view.render())
+            if not turn.delivery_dead:
+                self._stream_close(stream, view.render())
         finally:
             # A turn that is over must not leave live approval buttons behind.
             self.approvals.cancel_chat(chat_id, "the turn ended")
@@ -700,7 +709,11 @@ class Gateway:
     # ------------------------------------------------------------------ streaming
 
     def _stream_push(self, stream: MessageStream, text: str) -> bool:
-        """Coalesced push that never lets a Telegram failure kill a turn."""
+        """Coalesced push that never lets a Telegram failure kill a turn.
+
+        Returns False (instead of raising) when Telegram refused the push, so the
+        caller can count the failure and stop retrying once it is clearly dead.
+        """
         try:
             stream.push(text)
         except TelegramError as exc:
@@ -708,11 +721,26 @@ class Gateway:
             return False
         return True
 
-    def _stream_flush(self, stream: MessageStream) -> None:
+    def _stream_flush(self, stream: MessageStream) -> bool:
         try:
             stream.flush()
         except TelegramError as exc:
             self.log.error("Telegram edit failed for chat %s: %s", stream.chat_id, exc)
+            return False
+        return True
+
+    def _delivery_failed(self, stream: MessageStream) -> None:
+        """Surface a short, plain-text notice once a turn gave up on delivery.
+
+        Plain text on purpose: whatever the turn sent was refused for its markup,
+        so a formatted warning could be refused too. The full text is still in the
+        log for the operator; the chat just needs to know the turn did not hang.
+        """
+        self._reply(
+            stream.chat_id,
+            "⚠️ Telegram refused this turn's output and the gateway stopped retrying. "
+            "The turn will finish; the undelivered text is in the gateway log.",
+        )
 
     # ------------------------------------------------------------------ threads
 
@@ -977,6 +1005,12 @@ class _TurnStream:
     * when nothing visible changed for ``GATEWAY_HEARTBEAT_SECONDS``, a heartbeat
       line with the elapsed time is refreshed, so "still working" is obvious
       instead of looking hung.
+
+    A third rule keeps the turn honest when Telegram will not take the output: a
+    body it rejects for good (a parse error the plain-text fallback could not fix,
+    a chat that is gone) must not be retried on every poll forever. After
+    ``MAX_DELIVERY_FAILURES`` consecutive failures the turn stops pushing, says so
+    once in plain text, and runs to its end so the queue drains and /stop works.
     """
 
     def __init__(self, gateway: "Gateway", stream: MessageStream, view: TurnView, started: float) -> None:
@@ -989,6 +1023,8 @@ class _TurnStream:
         self.last_change = started
         self.last_beat: float | None = None
         self.heartbeat: str | None = None
+        self.delivery_failures = 0
+        self.delivery_dead = False
 
     @property
     def elapsed(self) -> float:
@@ -1008,7 +1044,43 @@ class _TurnStream:
                 self.sealed_chars = target
         self.body = body
         self.last_change = self.gateway.clock()
-        return self.gateway._stream_push(self.stream, body)
+        return self._push(body)
+
+    # ------------------------------------------------------------------ delivery
+
+    def _push(self, text: str) -> bool:
+        """Push text unless delivery is already dead; trip the breaker on failure."""
+        if self.delivery_dead:
+            return False
+        ok = self.gateway._stream_push(self.stream, text)
+        self._note_delivery(ok)
+        return ok
+
+    def _flush(self) -> None:
+        if self.delivery_dead:
+            return
+        self._note_delivery(self.gateway._stream_flush(self.stream))
+
+    def _note_delivery(self, ok: bool) -> None:
+        if ok:
+            self.delivery_failures = 0
+            return
+        self.delivery_failures += 1
+        if self.delivery_failures >= MAX_DELIVERY_FAILURES:
+            self._give_up()
+
+    def _give_up(self) -> None:
+        """Stop retrying this turn's delivery and say so in the chat, once."""
+        if self.delivery_dead:
+            return
+        self.delivery_dead = True
+        self.gateway.log.error(
+            "giving up on delivery for chat %s after %d consecutive failures; "
+            "the turn will finish so the queue drains and /stop keeps working",
+            self.stream.chat_id,
+            self.delivery_failures,
+        )
+        self.gateway._delivery_failed(self.stream)
 
     def _freeze(self, upto: str) -> bool:
         """Freeze the transcript exactly up to ``upto`` and start a new message.
@@ -1017,6 +1089,8 @@ class _TurnStream:
         inside the edit interval) and only then sealed: freezing text that is not
         on screen yet would make the next message repeat it.
         """
+        if self.delivery_dead:
+            return False
         try:
             self.stream.push(upto)
             self.stream.flush(force=True)
@@ -1024,7 +1098,9 @@ class _TurnStream:
             self.gateway.log.error(
                 "Telegram edit failed for chat %s: %s", self.stream.chat_id, exc
             )
+            self._note_delivery(False)
             return False
+        self._note_delivery(True)
         if not self.stream.seal(upto):
             return False
         self.gateway.log.debug(
@@ -1034,7 +1110,7 @@ class _TurnStream:
 
     def tick(self) -> None:
         """Called on every idle poll of the prompt loop: flush, then maybe beat."""
-        self.gateway._stream_flush(self.stream)
+        self._flush()
         seconds = self.gateway.config.heartbeat_seconds
         if seconds <= 0:
             return
@@ -1045,4 +1121,4 @@ class _TurnStream:
             return
         self.last_beat = now
         self.heartbeat = heartbeat_notice(now - self.started)
-        self.gateway._stream_push(self.stream, f"{self.body}\n\n{self.heartbeat}")
+        self._push(f"{self.body}\n\n{self.heartbeat}")

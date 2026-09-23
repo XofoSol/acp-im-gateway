@@ -26,11 +26,14 @@ PYTHON = sys.executable
 
 from acp_im_gateway.config import Config  # noqa: E402
 from acp_im_gateway.gateway import Gateway  # noqa: E402
-from acp_im_gateway.telegram import chunk_message  # noqa: E402
+from acp_im_gateway.telegram import TelegramError, chunk_message  # noqa: E402
 
 LOG = logging.getLogger("tests.harness")
 CHAT = 111
 USER = 900
+
+#: Telegram's description when it refuses a body for unparsable markup.
+PARSE_400_DESCRIPTION = "Bad Request: can't parse entities: Unexpected end tag at byte offset 16"
 
 
 # --------------------------------------------------------------------------- clock
@@ -88,6 +91,14 @@ class FakeTelegram:
         self.chat_actions: list[tuple[int, str]] = []
         self.fail_send: Exception | None = None
         self.fail_edit: Exception | None = None
+        #: When set, every HTML send/edit is refused with a parse 400 (like the
+        #: real Telegram on invalid markup) while plain-text calls go through.
+        self.reject_html = False
+        #: Every attempt, including ones rejected by ``fail_send``/``fail_edit``:
+        #: the rejected calls never reach ``calls``/``edits_log``, so tests that
+        #: assert "how many times did the gateway try" count these instead.
+        self.send_attempts = 0
+        self.edit_attempts = 0
         self._next_id = 500
         self._seq = 0
 
@@ -97,9 +108,15 @@ class FakeTelegram:
         self._seq += 1
         return self._seq
 
+    def _reject_markup(self, method: str, parse_mode: Any) -> None:
+        if self.reject_html and parse_mode == "HTML":
+            raise TelegramError(f"{method} failed: {PARSE_400_DESCRIPTION}", status=400)
+
     def reset(self) -> None:
         for collection in (self.messages, self.sent_messages, self.edits_log, self.calls):
             collection.clear()
+        self.send_attempts = 0
+        self.edit_attempts = 0
 
     def sent(self, chat_id: int | None = None) -> list[RecordedMessage]:
         return [
@@ -139,9 +156,11 @@ class FakeTelegram:
         chunk: bool = False,
         **kwargs: Any,
     ) -> list[dict[str, Any]]:
+        self.send_attempts += 1
         if self.fail_send is not None:
             raise self.fail_send
         parse_mode = kwargs.get("parse_mode")
+        self._reject_markup("sendMessage", parse_mode)
         thread_id = kwargs.get("message_thread_id")
         pieces = chunk_message(text, html=parse_mode == "HTML") if chunk else [text]
         out: list[dict[str, Any]] = []
@@ -184,11 +203,13 @@ class FakeTelegram:
         reply_markup: Mapping[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
+        self.edit_attempts += 1
         if self.fail_edit is not None:
             raise self.fail_edit
         chat_id = int(chat_id)
         message_id = int(message_id)
         parse_mode = kwargs.get("parse_mode")
+        self._reject_markup("editMessageText", parse_mode)
         self.calls.append(
             (
                 "editMessageText",

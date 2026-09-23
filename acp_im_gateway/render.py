@@ -575,13 +575,13 @@ class TurnView:
         icon = TOOL_ICONS.get(kind, "🔧")
 
         if kind == "execute" and command:
-            head = f"$ {escape(command)} [{status}]"
+            head = f"$ {escape(command)} [{escape(status)}]"
         elif kind in ("edit", "write") and path:
-            head = f"✏️ {escape(path)} [{status}]"
+            head = f"✏️ {escape(path)} [{escape(status)}]"
         elif kind == "read" and path:
-            head = f"{icon} {escape(path)} [{status}]"
+            head = f"{icon} {escape(path)} [{escape(status)}]"
         else:
-            head = f"{icon} {escape(title)} [{status}]"
+            head = f"{icon} {escape(title)} [{escape(status)}]"
 
         lines = [head]
         diff = str(state.get("diff") or "")
@@ -661,12 +661,17 @@ class TurnView:
         * every *whole* block before the last one is final;
         * for the agent's own message buffer, whole lines are final too: ACP text
           chunks are append-only deltas, so a finished line never changes.
+
+        The line-level cut applies *only* to that buffer. Any other last block (a
+        tool call, a plan) is not append-only — cutting into it could split a
+        ``<pre>`` and leave an unbalanced message Telegram would reject — so the
+        cut stops at the whole-block boundary instead.
         """
         parts = self._parts()
         if not parts:
             return 0
         offset = sum(len(part) + 2 for part in parts[:-1])
-        if self._finish is not None or self._thought:
+        if self._finish is not None or self._thought or not self._buffer:
             return offset
         cut = parts[-1].rfind("\n")
         return offset + cut if cut > 0 else offset
